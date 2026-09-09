@@ -114,7 +114,8 @@ test("transaction clocks are isolated from concurrent tests and actions", async 
   try {
     expect(Date.now()).toBe(now - 1000);
     expect(await first.action(async () => Date.now())).toBe(now - 1000);
-    expect(await second.query(async () => Date.now())).toBe(now - 1000);
+    // Its first commit is one nanosecond past its initial snapshot.
+    expect(await second.query(async () => Date.now())).toBe(now - 1000 + 1);
     vi.setSystemTime(now + 1000);
     expect(await first.action(async () => Date.now())).toBe(now + 1000);
     expect(await second.query(async () => Date.now())).toBe(now + 1000);
@@ -196,7 +197,7 @@ test("nested transactions ignore a caller's Date replacement", async () => {
     const id = await ctx.runMutation(api.commitTs.insertAndReadBack);
     const doc = await ctx.runQuery(api.commitTs.getDoc, { id });
     expect(doc!._creationTime).toBe(now);
-    expect(doc!.commitTs).toBe(BigInt(now) * 1_000_000n);
+    expect(doc!.commitTs).toBe(BigInt(now) * 1_000_000n + 1n);
     expect(Date.now()).toBe(now + 10_000);
   });
   await t.mutation(async (ctx) => {
@@ -243,7 +244,17 @@ test("clock changes and rollbacks do not leak transaction time", async () => {
 
   vi.useRealTimers();
   vi.useFakeTimers({ now: now - 1000 });
-  expect(await t.query(async () => Date.now())).toBe(now + 1);
+  // The prior read issued a snapshot at now + 1000. Neither the snapshot nor
+  // pinned transaction time can regress when the wall clock moves backwards.
+  expect(
+    await t.query(async () => ({
+      time: Date.now(),
+      snapshotTs: getSnapshotTs(),
+    })),
+  ).toEqual({
+    time: now + 1000,
+    snapshotTs: BigInt(now + 1000) * 1_000_000n,
+  });
   expect(Date.now()).toBe(now - 1000);
 });
 
