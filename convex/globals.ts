@@ -49,6 +49,12 @@ export const consumeRandom = internalMutation({
   handler: async () => Math.random(),
 });
 
+export const readTime = internalQuery({
+  args: {},
+  returns: v.number(),
+  handler: () => Date.now(),
+});
+
 export const readGlobalType = internalQuery({
   args: { name: v.string() },
   returns: v.string(),

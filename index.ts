@@ -1924,7 +1924,7 @@ function asyncSyscallImpl() {
                 });
               scheduler.add(promise);
             },
-            Math.max(0, tsInSecs * 1000 - Date.now()),
+            Math.max(0, tsInSecs * 1000 - frameworkNow()),
           );
         });
         return JSON.stringify(convexToJson(jobId));
@@ -2683,6 +2683,12 @@ const PATCHABLE_GLOBALS = [
 type GlobalOverrides = Record<string, unknown>;
 const globalOverridesStorage = new AsyncLocalStorage<GlobalOverrides>();
 
+// Framework clocks honor test setup (including fake timers), but not a
+// handler's pinned Date or its own replacement of that global.
+function frameworkNow(): number {
+  return globalOverridesStorage.exit(() => Date.now());
+}
+
 // The framework's own scheduler needs setTimeout even when running inside a
 // transaction context where setTimeout is disallowed for user code. Exit the
 // override store before reading globalThis.setTimeout so we get the underlying
@@ -2713,7 +2719,27 @@ function disallowedInTransaction(name: string): (...args: unknown[]) => never {
 }
 
 function transactionGlobalOverrides(): GlobalOverrides {
+  const BaseDate = globalOverridesStorage.exit(() => Date);
+  const time = getTransactionManager().getTime();
+  const now = () => time;
   return {
+    Date: new Proxy(BaseDate, {
+      get(target, property, receiver) {
+        return property === "now"
+          ? now
+          : Reflect.get(target, property, receiver);
+      },
+      construct(target, args, newTarget) {
+        return Reflect.construct(
+          target,
+          args.length === 0 ? [time] : args,
+          newTarget,
+        );
+      },
+      apply() {
+        return new BaseDate(time).toString();
+      },
+    }),
     fetch: disallowedInTransaction("fetch"),
     setTimeout: disallowedInTransaction("setTimeout"),
     clearTimeout: disallowedInTransaction("clearTimeout"),
@@ -2887,6 +2913,8 @@ class TransactionManager {
   // The latest committed transaction's timestamp, in Unix nanoseconds.
   // Zero represents the initial empty database, before any commits.
   private _lastCommitTs: bigint = 0n;
+  // Milliseconds pinned at top-level transaction start, shared by nested calls.
+  private _time: number | null = null;
 
   constructor(limitsConfig: Partial<TransactionMetrics> | boolean = false) {
     this._limitsConfig = limitsConfig;
@@ -2907,6 +2935,12 @@ class TransactionManager {
       while (this._waitOnCurrentFunction !== null) {
         await this._waitOnCurrentFunction;
       }
+      // Round up in bigint arithmetic so a one-nanosecond commit clock tick
+      // cannot disappear when converted to milliseconds.
+      this._time = Math.max(
+        frameworkNow(),
+        Number((this._lastCommitTs + 999_999n) / 1_000_000n),
+      );
       this._waitOnCurrentFunction = new Promise((resolve) => {
         this._markTransactionDone = resolve;
       });
@@ -2930,6 +2964,13 @@ class TransactionManager {
     return this._metricsTracker;
   }
 
+  getTime(): number {
+    if (this._time === null) {
+      throw new Error("Transaction not started");
+    }
+    return this._time;
+  }
+
   getSnapshotTs(): bigint {
     if (!this.isInTransaction()) {
       throw new Error(
@@ -2946,7 +2987,7 @@ class TransactionManager {
   commit(isNested: boolean): bigint | null {
     let commitTs: bigint | null = null;
     if (!isNested) {
-      const nowNanos = BigInt(Date.now()) * 1_000_000n;
+      const nowNanos = BigInt(frameworkNow()) * 1_000_000n;
       // Assign a new timestamp only when committing the outermost transaction.
       // Bump by one if the clock is frozen or has moved backwards.
       commitTs =
@@ -2976,6 +3017,7 @@ class TransactionManager {
       throw new Error("Transaction not started");
     }
     if (!isNested) {
+      this._time = null;
       this._metricsTracker = null;
       this._waitOnCurrentFunction = null;
       this._markTransactionDone();
