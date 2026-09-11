@@ -1,5 +1,10 @@
 # Changelog
 
+# Unreleased
+
+- Pin `Date.now()` and `new Date()` for each query or mutation, including nested
+  calls and `t.run`, at or after the transaction's snapshot timestamp.
+
 ## 0.0.62
 
 - Return typed component references from registerComponent (#161)
