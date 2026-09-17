@@ -2823,6 +2823,13 @@ function installGlobalProxies() {
   }
 }
 
+/**
+ * We use this wrapper every time we run user-provided code. Even though we
+ * already install global proxies when `convexTest()` is first called, they can
+ * be removed by changes we can't intercept (`delete`, `Object.defineProperty`,
+ * `vi.stubGlobal`…). Re-installing them before every handler repairs isolation
+ * after such changes.
+ */
 function runWithGlobalOverrides<T>(
   overrides: GlobalOverrides,
   handler: () => T,
