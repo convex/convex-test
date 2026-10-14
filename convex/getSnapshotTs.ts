@@ -31,3 +31,21 @@ export const snapshotMutation = mutation({
     return { id, snapshotTs, commitTs: ctx.db.vars.commitTs };
   },
 });
+
+// Reports the clocks a transaction observes, for checking that
+// `snapshotTs <= Date.now() <= _creationTime` like the Convex backend.
+export const insertAtPinnedTime = mutation({
+  args: {},
+  returns: v.object({
+    snapshotTs: v.int64(),
+    time: v.number(),
+    creationTime: v.number(),
+  }),
+  handler: async (ctx) => {
+    const snapshotTs = getSnapshotTs();
+    const time = Date.now();
+    const id = await ctx.db.insert("commitTs", {});
+    const doc = (await ctx.db.get(id))!;
+    return { snapshotTs, time, creationTime: doc._creationTime };
+  },
+});

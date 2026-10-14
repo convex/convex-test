@@ -1924,6 +1924,8 @@ function asyncSyscallImpl() {
                 });
               scheduler.add(promise);
             },
+            // Like the backend's scheduler, measure the due time against the
+            // wall clock, not the scheduling transaction's pinned time.
             Math.max(0, tsInSecs * 1000 - frameworkNow()),
           );
         });

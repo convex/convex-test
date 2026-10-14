@@ -296,3 +296,38 @@ test("scheduled timers use the wall clock when transaction time is pinned", asyn
   );
   expect(message?.body).toBe("already due");
 });
+
+test("snapshotTs <= Date.now() <= _creationTime, like the Convex backend", async () => {
+  vi.useFakeTimers({ now });
+  const t = convexTest(schema);
+  const check = (clocks: {
+    snapshotTs: bigint;
+    time: number;
+    creationTime: number;
+  }) => {
+    expect(BigInt(clocks.time) * 1_000_000n).toBeGreaterThanOrEqual(
+      clocks.snapshotTs,
+    );
+    expect(clocks.creationTime).toBeGreaterThanOrEqual(clocks.time);
+  };
+  // Frozen, forward, and backward wall clocks, including commits bumped one
+  // nanosecond past a frozen wall clock.
+  for (const delta of [0, 0, 0, 5000, -5000, 0]) {
+    vi.setSystemTime(now + delta);
+    check(await t.mutation(api.getSnapshotTs.insertAtPinnedTime, {}));
+    check(
+      await t.action((ctx) =>
+        ctx.runMutation(api.getSnapshotTs.insertAtPinnedTime, {}),
+      ),
+    );
+    check(
+      await t.run(async (ctx) => {
+        const snapshotTs = getSnapshotTs();
+        const time = Date.now();
+        const id = await ctx.db.insert("commitTs", {});
+        const doc = (await ctx.db.get(id))!;
+        return { snapshotTs, time, creationTime: doc._creationTime };
+      }),
+    );
+  }
+});

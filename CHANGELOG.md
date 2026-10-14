@@ -1,9 +1,12 @@
 # Changelog
 
-# Unreleased
+## Unreleased
 
 - Pin `Date.now()`, `Date()`, and `new Date()` for each query or mutation,
-  including nested calls and `t.run`, at or after the transaction's snapshot timestamp.
+  including nested calls and `t.run`. Like the Convex backend, the pinned time
+  is at or after the transaction's snapshot timestamp and at or before the
+  `_creationTime` of documents the transaction inserts. Scheduled functions
+  still become due according to the wall clock.
 
 ## 0.0.62
 
