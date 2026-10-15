@@ -156,7 +156,7 @@ test("a queued transaction pins its time after acquiring the lock", async () => 
   );
 });
 
-test("nested mutations insert at or after the parent transaction's time", async () => {
+test("nested queries and mutations use exactly the parent transaction's time", async () => {
   vi.useFakeTimers({ now });
   const t = convexTest(schema);
   await t.mutation(async () => null);
@@ -166,9 +166,15 @@ test("nested mutations insert at or after the parent transaction's time", async 
     expect(currentTime).toBe(now + 1);
     vi.setSystemTime(now + 1000);
     expect(await ctx.runQuery(internal.globals.readTime)).toBe(currentTime);
+    const nested = await ctx.runMutation(
+      api.getSnapshotTs.insertAtPinnedTime,
+      {},
+    );
+    expect(nested.time).toBe(currentTime);
+    expect(nested.creationTime).toBe(currentTime);
     const id = await ctx.runMutation(api.commitTs.insertAndReadBack);
     const doc = await ctx.runQuery(api.commitTs.getDoc, { id });
-    expect(doc!._creationTime).toBe(currentTime);
+    expect(doc!._creationTime).toBe(currentTime + 0.001);
     expect(Date.now()).toBe(currentTime);
   });
 });
