@@ -109,3 +109,105 @@ test("mutation generate upload URL", async () => {
   const result = await t.mutation(internal.storage.mutationGenerateUploadUrl);
   expect(result).toMatch("https://");
 });
+
+test("mutation store blob", async () => {
+  const t = convexTest(schema);
+  const bytes = new Uint8Array([0b00001100, 0b00000000]).buffer;
+  const storageId = await t.mutation(internal.storage.mutationStoreBlob, {
+    bytes,
+    contentType: "text/plain",
+  });
+  const result = await t.query(internal.storage.listFiles);
+  expect(result).toMatchObject([
+    {
+      _id: storageId,
+      sha256: "v2DkNJys5rzg1VLo14NCjbZtDWSb2eQwo2J+LuFKyDk=",
+      size: 2,
+      contentType: "text/plain",
+    },
+  ]);
+});
+
+test("mutation store blob with matching sha256", async () => {
+  const t = convexTest(schema);
+  const bytes = new Uint8Array([0b00001100, 0b00000000]).buffer;
+  const storageId = await t.mutation(internal.storage.mutationStoreBlob, {
+    bytes,
+    sha256: "v2DkNJys5rzg1VLo14NCjbZtDWSb2eQwo2J+LuFKyDk=",
+  });
+  expect(storageId).toBeTypeOf("string");
+});
+
+test("mutation store blob with mismatched sha256", async () => {
+  const t = convexTest(schema);
+  const bytes = new Uint8Array([0b00001100, 0b00000000]).buffer;
+  await expect(
+    t.mutation(internal.storage.mutationStoreBlob, {
+      bytes,
+      sha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    }),
+  ).rejects.toThrow(/Sha256 mismatch/);
+  expect(await t.query(internal.storage.listFiles)).toEqual([]);
+});
+
+test("mutation store blob rolls back", async () => {
+  const t = convexTest(schema);
+  const bytes = new Uint8Array([1, 2, 3]).buffer;
+  await expect(
+    t.mutation(internal.storage.mutationStoreBlobThenThrow, { bytes }),
+  ).rejects.toThrow("rollback");
+  expect(await t.query(internal.storage.listFiles)).toEqual([]);
+});
+
+test("mutation get blob", async () => {
+  const t = convexTest(schema);
+  const bytes = new Uint8Array([0b00001100, 0b00000000]).buffer;
+  const storageId = await t.mutation(internal.storage.mutationStoreBlob, {
+    bytes,
+    contentType: "image/png",
+  });
+  const result = await t.mutation(internal.storage.mutationGetBlob, {
+    id: storageId,
+  });
+  expect(result).toEqual({ bytes, type: "image/png" });
+});
+
+test("mutation get blob stored in the same mutation", async () => {
+  const t = convexTest(schema);
+  const bytes = new Uint8Array([4, 5, 6]).buffer;
+  const result = await t.mutation(internal.storage.mutationStoreAndGetBlob, {
+    bytes,
+  });
+  expect(result).toEqual(bytes);
+});
+
+test("mutation get blob deleted in the same mutation", async () => {
+  const t = convexTest(schema);
+  const bytes = new Uint8Array([1, 2]).buffer;
+  const storageId = await t.mutation(internal.storage.mutationStoreBlob, {
+    bytes,
+  });
+  const result = await t.mutation(async (ctx) => {
+    await ctx.storage.delete(storageId);
+    return await ctx.storage.get(storageId);
+  });
+  expect(result).toBeNull();
+});
+
+test("snapshot query does not see files stored in the same mutation", async () => {
+  const t = convexTest(schema);
+  const { id, filesDuringSnapshot } = await t.mutation(async (ctx) => {
+    const id = await ctx.storage.store(new Blob([new Uint8Array(3)]));
+    const filesDuringSnapshot = await ctx.runQuery(
+      internal.storage.listFiles,
+      {},
+      { useStaleSnapshot: true },
+    );
+    expect(await ctx.storage.get(id)).not.toBeNull();
+    return { id, filesDuringSnapshot };
+  });
+  expect(filesDuringSnapshot).toEqual([]);
+  expect(
+    await t.mutation(internal.storage.mutationGetBlob, { id }),
+  ).toMatchObject({ bytes: new Uint8Array(3).buffer });
+});
