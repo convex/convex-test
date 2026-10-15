@@ -2923,7 +2923,7 @@ class TransactionManager {
   // Zero represents the initial empty database, before any commits.
   private _lastCommitTs: bigint = 0n;
   // Milliseconds pinned at top-level transaction start, shared by nested calls.
-  private _time: number | null = null;
+  private _udfTime: number | null = null;
 
   constructor(limitsConfig: Partial<TransactionMetrics> | boolean = false) {
     this._limitsConfig = limitsConfig;
@@ -2946,7 +2946,7 @@ class TransactionManager {
       }
       // Round up in bigint arithmetic so a one-nanosecond commit clock tick
       // cannot disappear when converted to milliseconds.
-      this._time = Math.max(
+      this._udfTime = Math.max(
         frameworkNow(),
         Number((this._lastCommitTs + 999_999n) / 1_000_000n),
       );
@@ -2974,10 +2974,10 @@ class TransactionManager {
   }
 
   getTime(): number {
-    if (this._time === null) {
+    if (this._udfTime === null) {
       throw new Error("Transaction not started");
     }
-    return this._time;
+    return this._udfTime;
   }
 
   getSnapshotTs(): bigint {
@@ -3026,7 +3026,7 @@ class TransactionManager {
       throw new Error("Transaction not started");
     }
     if (!isNested) {
-      this._time = null;
+      this._udfTime = null;
       this._metricsTracker = null;
       this._waitOnCurrentFunction = null;
       this._markTransactionDone();
