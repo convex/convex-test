@@ -287,8 +287,8 @@ test("components can paginate directly and from an app query", async () => {
   expect(nested).toEqual(direct);
 });
 
-test.each(["query", "mutation"] as const)(
-  "app and component pagination share a limit in a %s",
+test.each(["query", "mutation", "run"] as const)(
+  "app and component pagination in a %s",
   async (udfType) => {
     const t = testWithCounter();
     for (const componentFirst of [false, true]) {
@@ -302,23 +302,37 @@ test.each(["query", "mutation"] as const)(
         await (componentFirst ? component() : app());
         await (componentFirst ? app() : component());
       };
-      await expect(
-        udfType === "query" ? t.query(handler) : t.mutation(handler),
-      ).rejects.toThrow(/single paginated query.*transaction/);
+      if (udfType === "query") {
+        await expect(t.query(handler)).rejects.toThrow(
+          /single paginated query.*per query/,
+        );
+      } else {
+        await expect(
+          udfType === "mutation" ? t.mutation(handler) : t.run(handler),
+        ).resolves.toBeNull();
+      }
     }
   },
 );
 
-test("pagination in different components shares a transaction limit", async () => {
-  const t = testWithTwoCounters();
-  await expect(
-    t.query(async (ctx) => {
+test.each(["query", "mutation"] as const)(
+  "pagination in different components called from a %s",
+  async (udfType) => {
+    const t = testWithTwoCounters();
+    const handler = async (ctx: QueryCtx) => {
       await ctx.runQuery(components.counter.public.paginate, {
         paginationOpts: { numItems: 10, cursor: null },
       });
       await ctx.runQuery(components.counter2.public.paginate, {
         paginationOpts: { numItems: 10, cursor: null },
       });
-    }),
-  ).rejects.toThrow(/single paginated query.*transaction/);
-});
+    };
+    if (udfType === "query") {
+      await expect(t.query(handler)).rejects.toThrow(
+        /single paginated query.*per query/,
+      );
+    } else {
+      await expect(t.mutation(handler)).resolves.toBeNull();
+    }
+  },
+);

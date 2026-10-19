@@ -1,9 +1,9 @@
 import { expect, test } from "vitest";
 import { convexTest } from "../index";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import type { PaginationResult } from "convex/server";
-import type { QueryCtx } from "./_generated/server";
+import type { MutationCtx, QueryCtx } from "./_generated/server";
 
 test("paginate", async () => {
   const t = convexTest(schema);
@@ -401,7 +401,7 @@ test("paginate with deletes and composite index", async () => {
 const paginateOnce = (ctx: QueryCtx) =>
   ctx.db.query("messages").paginate({ cursor: null, numItems: 10 });
 
-test("multiple paginate calls in one transaction throw", async () => {
+test("multiple paginate calls in one query throw", async () => {
   const t = convexTest({ schema });
   await t.run(async (ctx) => {
     await ctx.db.insert("messages", { author: "sarah", body: "hello" });
@@ -455,8 +455,8 @@ test("an action can paginate in separate query transactions", async () => {
   expect(result.second.page.length).toBe(1);
 });
 
-test.each(["query", "mutation"] as const)(
-  "nested queries share the enclosing %s pagination limit",
+test.each(["query", "mutation", "run"] as const)(
+  "multiple paginated queries called from a %s",
   async (udfType) => {
     const t = convexTest({ schema });
     const handler = async (ctx: QueryCtx) => {
@@ -467,11 +467,48 @@ test.each(["query", "mutation"] as const)(
         paginationOptions: { cursor: null, numItems: 10 },
       });
     };
-    await expect(
-      udfType === "query" ? t.query(handler) : t.mutation(handler),
-    ).rejects.toThrow(/single paginated query.*transaction/);
+    if (udfType === "query") {
+      await expect(t.query(handler)).rejects.toThrow(
+        /single paginated query.*per query/,
+      );
+    } else {
+      await expect(
+        udfType === "mutation" ? t.mutation(handler) : t.run(handler),
+      ).resolves.toBeNull();
+    }
 
     // A failed transaction must not consume the next transaction's allowance.
     await expect(t.query(paginateOnce)).resolves.toMatchObject({ page: [] });
+  },
+);
+
+test.each(["mutation", "run"] as const)(
+  "multiple direct paginate calls are allowed in a %s",
+  async (udfType) => {
+    const t = convexTest({ schema });
+    const handler = async (ctx: MutationCtx) => {
+      await ctx.db.insert("messages", { author: "sarah", body: "hello" });
+      const first = await paginateOnce(ctx);
+      const second = await paginateOnce(ctx);
+      return { first, second };
+    };
+    const result =
+      udfType === "mutation" ? await t.mutation(handler) : await t.run(handler);
+    expect(result.first.page).toMatchObject([
+      { author: "sarah", body: "hello" },
+    ]);
+    expect(result.second).toEqual(result.first);
+  },
+);
+
+test.each([false, true])(
+  "a query called from a mutation still enforces its limit (nested: %s)",
+  async (nested) => {
+    const t = convexTest({ schema });
+    await expect(
+      t.mutation(async (ctx) => {
+        await ctx.runQuery(internal.pagination.paginateTwice, { nested });
+      }),
+    ).rejects.toThrow(/single paginated query.*per query/);
   },
 );

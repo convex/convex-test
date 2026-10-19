@@ -1624,7 +1624,17 @@ function asyncSyscallImpl() {
           maximumRowsRead,
           maximumBytesRead,
         } = args;
-        getTransactionManager().trackPaginatedQuery();
+        const pagination = executionContextStorage.getStore()?.pagination;
+        if (pagination) {
+          pagination.calls += 1;
+          if (pagination.calls > 1) {
+            throw new Error(
+              "Only a single paginated query (`.paginate()`) is allowed per " +
+                "query, including nested query calls and component calls. " +
+                "This is a Convex limit: https://docs.convex.dev/database/pagination",
+            );
+          }
+        }
         const { page, isDone, continueCursor, splitCursor, pageStatus } =
           db.paginate({
             query,
@@ -2524,6 +2534,9 @@ type ExecutionContext = {
   udfPath: string;
   udfType: UdfType;
   depth: number; // 0 = top-level, 1+ = nested
+  // Queries share this counter with their nested queries, including components.
+  // Mutations have no counter; each query they call gets a fresh one.
+  pagination?: { calls: number };
 };
 
 const executionContextStorage = new AsyncLocalStorage<ExecutionContext>();
@@ -2835,9 +2848,6 @@ class TransactionManager {
   // `startTransaction` / `commit` / `rollback` in lockstep with the databases'.
   private _metricsTracker: TransactionMetricsTracker | null = null;
   private _limitsConfig: Partial<TransactionMetrics> | boolean;
-  // Shared by all nested calls, including calls into components. This count
-  // is not rolled back when a nested call returns or throws.
-  private _paginatedQueries = 0;
   // The latest committed transaction's timestamp, in Unix nanoseconds.
   // Zero represents the initial empty database, before any commits.
   private _lastCommitTs: bigint = 0n;
@@ -2865,7 +2875,6 @@ class TransactionManager {
         this._markTransactionDone = resolve;
       });
       this._metricsTracker = new TransactionMetricsTracker(this._limitsConfig);
-      this._paginatedQueries = 0;
     }
     const convex = getConvexGlobal();
     for (const component of Object.values(convex.components)) {
@@ -2883,17 +2892,6 @@ class TransactionManager {
   // The metrics tracker, or null when not inside a transaction.
   getMetricsTracker(): TransactionMetricsTracker | null {
     return this._metricsTracker;
-  }
-
-  trackPaginatedQuery() {
-    this._paginatedQueries += 1;
-    if (this._paginatedQueries > 1) {
-      throw new Error(
-        "Only a single paginated query (`.paginate()`) is allowed per " +
-          "transaction, including nested function calls and component calls. " +
-          "This is a Convex limit: https://docs.convex.dev/database/pagination",
-      );
-    }
   }
 
   getSnapshotTs(): bigint {
@@ -3001,9 +2999,9 @@ export function convexTest<Schema extends GenericSchema>(
  *     - `true` or `{}`: enforce default Convex limits
  *     - `{ bytesRead: 1024 }`: override specific limits
  *
- * Regardless of `transactionLimits`, a transaction may only run one paginated
- * query (`.paginate()`), including nested function calls and component calls;
- * calling it more than once throws.
+ * Regardless of `transactionLimits`, a query may only call `.paginate()` once,
+ * including nested query calls and component calls. Mutations may paginate
+ * multiple times and call multiple queries that each paginate once.
  *
  * @returns an object which is by convention stored in the `t` variable
  *   and which provides methods for exercising your Convex functions.
@@ -3266,6 +3264,7 @@ function withAuth(
       udfPath: functionPath.udfPath,
       udfType: "query",
       depth: (parentCtx?.depth ?? 0) + 1,
+      pagination: (isNested && parentCtx?.pagination) || { calls: 0 },
     };
     const requestMetadata = requestMetadataForExecution();
 

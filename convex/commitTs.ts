@@ -248,8 +248,7 @@ export const insertThenThrow = mutation(async ({ db }) => {
 
 // Paginating over rows this mutation staged. The continuation cursor is encoded
 // from the last row's pre-commit view, which would throw if it were encoded from
-// the placeholder itself. Only one `.paginate()` is allowed per transaction, so the
-// cursor is returned rather than followed here.
+// the placeholder itself. Return the cursor so the test can inspect it.
 export const paginateOverPending = mutation(async ({ db }) => {
   await db.insert("commitTs", { commitTs: db.vars.commitTs, other: "a" });
   await db.insert("commitTs", { commitTs: db.vars.commitTs, other: "b" });
