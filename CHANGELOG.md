@@ -6,7 +6,7 @@
   including nested calls and `t.run`. Like the Convex backend, the pinned time
   is at or after the transaction's snapshot timestamp and at or before the
   `_creationTime` of documents the transaction inserts. Scheduled functions
-  still become due according to the wall clock.
+  still become due according to the wall clock, as in the real Convex backend.
 
 ## 0.0.62
 
