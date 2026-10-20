@@ -60,6 +60,7 @@ import {
 // Real Convex IDs are 32 characters. IDs may exceed this length for very long
 // table names or large numbers of documents, but this is the typical target.
 const TYPICAL_CONVEX_ID_LENGTH = 32;
+const MAX_SEARCH_CANDIDATE_REVISIONS = 1024;
 
 type FilterJson =
   | { $eq: [FilterJson, FilterJson] }
@@ -804,9 +805,12 @@ class DatabaseFake {
         // Like the backend, check before testing for exhaustion and before
         // applying post-search filters. Search index equality filters have
         // already been applied by _resolveQuerySource().
-        if (query.source.type === "Search" && scanned === 1024) {
+        if (
+          query.source.type === "Search" &&
+          scanned === MAX_SEARCH_CANDIDATE_REVISIONS
+        ) {
           throw new Error(
-            "Search query scanned too many documents (fetched 1024). " +
+            `Search query scanned too many documents (fetched ${MAX_SEARCH_CANDIDATE_REVISIONS}). ` +
               "Consider using a smaller limit, paginating the query, or using a filter " +
               "field to limit the number of documents pulled from the search index.",
           );
