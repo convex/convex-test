@@ -162,6 +162,10 @@ const convexGlobalStorage = new AsyncLocalStorage<ConvexGlobal>();
 class DatabaseFake {
   private _componentPath: string;
   private _documents: Record<DocumentId, StoredDocument> = {};
+  // Ids of committed documents, grouped by table name, so queries only
+  // visit documents in the table they read from. Kept in sync with
+  // `_documents` in `commit`.
+  private _tableIds: Map<string, Set<DocumentId>> = new Map();
   private _storage: Record<DocumentId, Blob> = {};
   private _nextQueryId: QueryId = 1;
   private _nextDocId: number = 10000;
@@ -418,11 +422,19 @@ class DatabaseFake {
     for (const [id, write] of Object.entries(lastWrites)) {
       const _id = id as DocumentId;
       if (this._writes.length === 0) {
+        const tableName = tableNameFromId(_id)!;
         if (write === null) {
           delete this._documents[_id];
+          this._tableIds.get(tableName)?.delete(_id);
         } else {
           this._documents[_id] =
             commitTs === null ? write : resolveCommittedValues(write, commitTs);
+          let tableIds = this._tableIds.get(tableName);
+          if (tableIds === undefined) {
+            tableIds = new Set();
+            this._tableIds.set(tableName, tableIds);
+          }
+          tableIds.add(_id);
         }
       } else {
         this._addWrite(_id, write);
@@ -677,7 +689,7 @@ class DatabaseFake {
     callback: (doc: GenericDocument) => void,
   ) {
     const isInTable = (id: string) => tableNameFromId(id) === tableName;
-    const ids = new Set(Object.keys(this._documents).filter(isInTable));
+    const ids = new Set<string>(this._tableIds.get(tableName));
     for (let i = 0; i < this._writes.length; i++) {
       for (const id of Object.keys(this._writes[i]).filter(isInTable)) {
         ids.add(id);
