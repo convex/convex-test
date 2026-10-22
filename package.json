@@ -48,7 +48,7 @@
     "@typescript-eslint/eslint-plugin": "8.58.2",
     "@typescript-eslint/parser": "8.58.2",
     "@vitest/coverage-v8": "1.6.1",
-    "convex": "1.43.0",
+    "convex": "https://pkg.pr.new/convex/convex@ae16e98",
     "eslint": "9.39.4",
     "globals": "17.5.0",
     "jose": "^6.2.12",

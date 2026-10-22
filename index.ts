@@ -1981,6 +1981,39 @@ function asyncSyscallImpl() {
           (sha256 as string);
         return JSON.stringify(convexToJson(url));
       }
+      case "1.0/storageStore": {
+        const { blob, contentType, sha256: expectedSha256 } = args;
+        const bytes = base64ToBytes(blob);
+        const type = contentType || undefined;
+        const file = new Blob([bytes], { type });
+        const sha256 = await blobSha(file);
+        if (expectedSha256 != null && expectedSha256 !== sha256) {
+          throw new Error(
+            `Sha256 mismatch. Expected: ${expectedSha256} Actual: ${sha256}`,
+          );
+        }
+        const storageId = await writeToDatabase(async (db) => {
+          return db.insert("_storage", {
+            size: bytes.length,
+            sha256,
+            ...(type !== undefined ? { contentType: type } : {}),
+          });
+        });
+        db.storeFile(storageId, file);
+        return JSON.stringify(convexToJson(storageId));
+      }
+      case "1.0/storageGet": {
+        const { storageId } = args;
+        const file = db.getFile(storageId);
+        if (file == null) {
+          return JSON.stringify(null);
+        }
+        const metadata = db.get("_storage", storageId)!;
+        return JSON.stringify({
+          blob: bytesToBase64(new Uint8Array(await file.arrayBuffer())),
+          contentType: metadata.contentType ?? null,
+        });
+      }
       case "1.0/storageGenerateUploadUrl": {
         // In the real backend the token is cryptographically secure
         const url =
@@ -2061,6 +2094,26 @@ async function blobSha(blob: Blob) {
   const hashBuffer = await crypto.subtle.digest("SHA-256", arrayBuffer);
   const hashArray = new Uint8Array(hashBuffer);
   return btoa(String.fromCharCode(...hashArray));
+}
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = "";
+  // Chunked so that spreading into `fromCharCode` stays under the engine's
+  // argument count limit for large files.
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+function base64ToBytes(base64: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
 }
 
 export type TestConvex<SchemaDef extends SchemaDefinition<any, boolean>> =
