@@ -162,6 +162,12 @@ const convexGlobalStorage = new AsyncLocalStorage<ConvexGlobal>();
 class DatabaseFake {
   private _componentPath: string;
   private _documents: Record<DocumentId, StoredDocument> = {};
+  // The committed documents' ids per table, in commit order: the order
+  // `Object.keys(this._documents)` lists them in.
+  private _tableIds: Map<string, Set<DocumentId>> = new Map();
+  // A sorted copy of the committed documents for each index a query has
+  // used, kept in step with every top-level commit (`_updateIndexes`).
+  private _indexes: Map<string, SortedIndex> = new Map();
   private _storage: Record<DocumentId, Blob> = {};
   private _nextQueryId: QueryId = 1;
   private _nextDocId: number = 10000;
@@ -259,7 +265,91 @@ class DatabaseFake {
     if (this._writes.length === 0) {
       throw new Error(`Write outside of transaction ${id}`);
     }
-    this._writes[this._writes.length - 1][id] = newValue;
+    const level = this._writes[this._writes.length - 1];
+    level[id] = newValue;
+    let tables = pendingIdsByLevel.get(level);
+    if (tables === undefined) {
+      tables = new Map();
+      pendingIdsByLevel.set(level, tables);
+    }
+    const table = tableNameFromId(id)!;
+    let ids = tables.get(table);
+    if (ids === undefined) {
+      ids = new Set();
+      tables.set(table, ids);
+    }
+    ids.add(id);
+  }
+
+  // The ids of the table's documents that pending writes hold, or null.
+  private _pendingIds(tableName: string): Set<DocumentId> | null {
+    let all: Set<DocumentId> | null = null;
+    for (const level of this._writes) {
+      const ids = pendingIdsByLevel.get(level)?.get(tableName);
+      if (ids === undefined) {
+        continue;
+      }
+      all ??= new Set();
+      for (const id of ids) {
+        all.add(id);
+      }
+    }
+    return all;
+  }
+
+  // A document as the transaction sees it: its newest write, else committed.
+  private _newest(id: DocumentId): StoredDocument | null {
+    for (let i = this._writes.length - 1; i >= 0; i--) {
+      const write = this._writes[i][id];
+      if (write !== undefined) {
+        return write;
+      }
+    }
+    return this._documents[id] ?? null;
+  }
+
+  // The index's entries: every committed document of the table with its key
+  // (the index's fields, then `_creationTime` and `_id`), ascending.
+  private _indexEntries(tableName: string, fields: string[]): IndexEntry[] {
+    const indexKey = `${tableName}\u0000${fields.join("\u0000")}`;
+    let index = this._indexes.get(indexKey);
+    if (index === undefined) {
+      const entries: IndexEntry[] = [];
+      for (const id of this._tableIds.get(tableName) ?? []) {
+        const doc = this._documents[id];
+        entries.push({ doc, key: indexKeyOf(doc, fields) });
+      }
+      entries.sort((a, b) => compareKeys(a.key, b.key));
+      index = { tableName, fields, entries };
+      this._indexes.set(indexKey, index);
+    }
+    return index.entries;
+  }
+
+  private _updateIndexes(
+    tableName: string,
+    oldDoc: StoredDocument | undefined,
+    newDoc: StoredDocument | null,
+  ) {
+    for (const [indexKey, index] of this._indexes) {
+      if (index.tableName !== tableName) {
+        continue;
+      }
+      const { entries, fields } = index;
+      if (oldDoc !== undefined) {
+        const at = lowerBound(entries, indexKeyOf(oldDoc, fields));
+        if (entries[at]?.doc !== oldDoc) {
+          // Out of step: drop it, to be rebuilt when next used.
+          this._indexes.delete(indexKey);
+          continue;
+        }
+        entries.splice(at, 1);
+      }
+      if (newDoc !== null) {
+        const key = indexKeyOf(newDoc, fields);
+        entries.splice(lowerBound(entries, key), 0, { doc: newDoc, key });
+      }
+    }
   }
 
   insert<Table extends TableName>(table: Table, value: any) {
@@ -418,11 +508,23 @@ class DatabaseFake {
     for (const [id, write] of Object.entries(lastWrites)) {
       const _id = id as DocumentId;
       if (this._writes.length === 0) {
+        const table = tableNameFromId(_id)!;
+        const oldDoc = this._documents[_id];
         if (write === null) {
           delete this._documents[_id];
+          this._tableIds.get(table)?.delete(_id);
+          this._updateIndexes(table, oldDoc, null);
         } else {
-          this._documents[_id] =
+          const newDoc =
             commitTs === null ? write : resolveCommittedValues(write, commitTs);
+          this._documents[_id] = newDoc;
+          let ids = this._tableIds.get(table);
+          if (ids === undefined) {
+            ids = new Set();
+            this._tableIds.set(table, ids);
+          }
+          ids.add(_id);
+          this._updateIndexes(table, oldDoc, newDoc);
         }
       } else {
         this._addWrite(_id, write);
@@ -676,17 +778,23 @@ class DatabaseFake {
     tableName: string,
     callback: (doc: GenericDocument) => void,
   ) {
-    const isInTable = (id: string) => tableNameFromId(id) === tableName;
-    const ids = new Set(Object.keys(this._documents).filter(isInTable));
+    // The table's committed documents in commit order, then the ones only
+    // pending writes hold, each at its newest write.
+    const committed = this._tableIds.get(tableName) ?? new Set<DocumentId>();
+    const pending = new Set<DocumentId>();
     for (let i = 0; i < this._writes.length; i++) {
-      for (const id of Object.keys(this._writes[i]).filter(isInTable)) {
-        ids.add(id);
+      for (const id of Object.keys(this._writes[i]) as DocumentId[]) {
+        if (!committed.has(id) && tableNameFromId(id) === tableName) {
+          pending.add(id);
+        }
       }
     }
-    for (const id of ids) {
-      const document = this.get(tableName, id as DocumentId);
-      if (document !== null) {
-        callback(document);
+    for (const ids of [committed, pending]) {
+      for (const id of ids) {
+        const document = this._newest(id);
+        if (document !== null) {
+          callback(document);
+        }
       }
     }
   }
@@ -709,6 +817,7 @@ class DatabaseFake {
     const results: GenericDocument[] = [];
     let fieldPathsToSortBy: string[];
     let order: "asc" | "desc";
+    let sorted = false;
     switch (source.type) {
       case "FullTableScan": {
         const tableName = source.tableName;
@@ -746,13 +855,54 @@ class DatabaseFake {
 
         validateIndexRangeExpression(source, fields);
 
-        this._iterateDocs(tableName, (doc) => {
-          if (
-            source.range.every((filter) => evaluateRangeFilter(doc, filter))
-          ) {
+        // Each bound's value once, not once per document.
+        const range: EvaluatedRange = source.range.map((filter) => ({
+          type: filter.type,
+          fieldPath: filter.fieldPath,
+          value: evaluateQueryValue(filter.value),
+        }));
+        const inRange = (doc: GenericDocument) =>
+          range.every((filter) => evaluateRangeFilter(doc, filter));
+        // The committed documents in range are a contiguous block of the
+        // index, less those the pending writes change; then the pending
+        // writes' documents in range, merged in by index key.
+        const pending = this._pendingIds(tableName);
+        const entries = this._indexEntries(tableName, fields);
+        const from = firstIndexWhere(
+          entries,
+          (entry) => !isBeforeRange(entry.key, fields, range),
+        );
+        const to = firstIndexWhere(
+          entries,
+          (entry) => isAfterRange(entry.key, fields, range),
+          from,
+        );
+        for (let i = from; i < to; i++) {
+          const doc = entries[i].doc;
+          if (pending === null || !pending.has(doc._id)) {
             results.push(doc);
           }
-        });
+        }
+        if (pending !== null) {
+          let added = false;
+          for (const id of pending) {
+            const doc = this._newest(id);
+            if (doc !== null && inRange(doc)) {
+              results.push(doc);
+              added = true;
+            }
+          }
+          if (added) {
+            const keys = new Map(
+              results.map((doc) => [doc, indexKeyOf(doc, fields)]),
+            );
+            results.sort((a, b) => compareKeys(keys.get(a)!, keys.get(b)!));
+          }
+        }
+        if (order === "desc") {
+          results.reverse();
+        }
+        sorted = true;
         break;
       }
       case "Search": {
@@ -781,17 +931,16 @@ class DatabaseFake {
         (operator): operator is { limit: number } => "limit" in operator,
       )[0] ?? null;
 
-    results.sort((a, b) => {
+    if (!sorted) {
+      // Each document's sort key once, not once per comparison.
+      const keys = new Map(
+        results.map((doc) => [doc, indexKeyOf(doc, fieldPathsToSortBy)]),
+      );
       const orderMultiplier = order === "asc" ? 1 : -1;
-      let v = 0;
-      for (const fp of fieldPathsToSortBy) {
-        v = compareValues(evaluateFieldPath(fp, a), evaluateFieldPath(fp, b));
-        if (v !== 0) {
-          return v * orderMultiplier;
-        }
-      }
-      return v * orderMultiplier;
-    });
+      results.sort(
+        (a, b) => compareKeys(keys.get(a)!, keys.get(b)!) * orderMultiplier,
+      );
+    }
 
     const filterFn = (doc: GenericDocument) =>
       filters.every((f) => evaluateFilter(doc, f));
@@ -885,7 +1034,19 @@ class DatabaseFake {
   }
 }
 
+// Ids never change, so each one's table is worked out once.
+const tableNames = new Map<string, string | null>();
+
 function tableNameFromId(id: string) {
+  let tableName = tableNames.get(id);
+  if (tableName === undefined) {
+    tableName = parseTableNameFromId(id);
+    tableNames.set(id, tableName);
+  }
+  return tableName;
+}
+
+function parseTableNameFromId(id: string) {
   const match = id.match(/^[0-9]+/);
   if (!match || match[0].length === id.length) {
     return null;
@@ -977,7 +1138,28 @@ function substituteCommitTs<T extends Value>(value: T, commitTs: bigint): T {
   ) as T;
 }
 
+// A stored document is never changed in place (every write stores a new
+// object), so each of its field paths is evaluated once.
+const fieldPathValues = new WeakMap<object, Map<string, Value | undefined>>();
+
 function evaluateFieldPath(fieldPath: string, document: any) {
+  if (document === null || typeof document !== "object") {
+    return evaluateFieldPathUncached(fieldPath, document);
+  }
+  let values = fieldPathValues.get(document);
+  if (values === undefined) {
+    values = new Map();
+    fieldPathValues.set(document, values);
+  }
+  if (values.has(fieldPath)) {
+    return values.get(fieldPath);
+  }
+  const value = evaluateFieldPathUncached(fieldPath, document);
+  values.set(fieldPath, value);
+  return value;
+}
+
+function evaluateFieldPathUncached(fieldPath: string, document: any) {
   const pathParts = fieldPath.split(".");
   let result: Value | undefined = document;
   for (const p of pathParts) {
@@ -1081,23 +1263,129 @@ function evaluateFilter(
   throw new Error(`not implemented: ${JSON.stringify(filter)}`);
 }
 
+type IndexEntry = { doc: StoredDocument; key: Array<Value | undefined> };
+type SortedIndex = {
+  tableName: string;
+  fields: string[];
+  entries: IndexEntry[];
+};
+type EvaluatedRange = Array<{
+  type: SerializedRangeExpression["type"];
+  fieldPath: string;
+  value: Value | undefined;
+}>;
+
+// Each level of pending writes' ids, by table.
+const pendingIdsByLevel = new WeakMap<object, Map<string, Set<DocumentId>>>();
+
+function indexKeyOf(
+  doc: GenericDocument,
+  fields: string[],
+): Array<Value | undefined> {
+  return fields.map((fp) => evaluateFieldPath(fp, doc));
+}
+
+function compareKeys(
+  a: Array<Value | undefined>,
+  b: Array<Value | undefined>,
+): number {
+  for (let i = 0; i < a.length; i++) {
+    const v = compareValues(a[i], b[i]);
+    if (v !== 0) {
+      return v;
+    }
+  }
+  return 0;
+}
+
+// The first entry at or after `key`.
+function lowerBound(entries: IndexEntry[], key: Array<Value | undefined>) {
+  return firstIndexWhere(entries, (entry) => compareKeys(entry.key, key) >= 0);
+}
+
+// The first index from `from` where `predicate` holds, for a predicate that
+// is false and then true along `entries`.
+function firstIndexWhere(
+  entries: IndexEntry[],
+  predicate: (entry: IndexEntry) => boolean,
+  from = 0,
+) {
+  let low = from;
+  let high = entries.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (predicate(entries[mid])) {
+      high = mid;
+    } else {
+      low = mid + 1;
+    }
+  }
+  return low;
+}
+
+// A range (see `validateIndexRangeExpression`) is equalities on a prefix of
+// the index's fields, then at most a lower and an upper bound on the next
+// field. Along the index's order, the keys before the range come first and
+// the keys after it last.
+function isBeforeRange(
+  key: Array<Value | undefined>,
+  fields: string[],
+  range: EvaluatedRange,
+) {
+  for (const filter of range) {
+    const c = compareValues(
+      key[fields.indexOf(filter.fieldPath)],
+      filter.value,
+    );
+    if (filter.type === "Eq") {
+      if (c !== 0) {
+        return c < 0;
+      }
+    } else if (filter.type === "Gt" || filter.type === "Gte") {
+      return c < 0 || (c === 0 && filter.type === "Gt");
+    }
+  }
+  return false;
+}
+
+function isAfterRange(
+  key: Array<Value | undefined>,
+  fields: string[],
+  range: EvaluatedRange,
+) {
+  for (const filter of range) {
+    const c = compareValues(
+      key[fields.indexOf(filter.fieldPath)],
+      filter.value,
+    );
+    if (filter.type === "Eq") {
+      if (c !== 0) {
+        return c > 0;
+      }
+    } else if (filter.type === "Lt" || filter.type === "Lte") {
+      return c > 0 || (c === 0 && filter.type === "Lt");
+    }
+  }
+  return false;
+}
+
+// Whether `document` meets `filter`, a bound whose value is already evaluated.
 function evaluateRangeFilter(
   document: GenericDocument,
-  expr: SerializedRangeExpression,
+  filter: EvaluatedRange[number],
 ) {
-  const result = evaluateFieldPath(expr.fieldPath, document);
-  const value = evaluateQueryValue(expr.value);
-  switch (expr.type) {
+  const result = evaluateFieldPath(filter.fieldPath, document);
+  switch (filter.type) {
     case "Eq":
-      return compareValues(result, value) === 0;
+      return compareValues(result, filter.value) === 0;
     case "Gt":
-      return compareValues(result, value) > 0;
+      return compareValues(result, filter.value) > 0;
     case "Gte":
-      return compareValues(result, value) >= 0;
+      return compareValues(result, filter.value) >= 0;
     case "Lt":
-      return compareValues(result, value) < 0;
+      return compareValues(result, filter.value) < 0;
     case "Lte":
-      return compareValues(result, value) <= 0;
+      return compareValues(result, filter.value) <= 0;
   }
 }
 
