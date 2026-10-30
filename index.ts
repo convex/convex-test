@@ -1221,6 +1221,7 @@ type ValidatorJSON =
   | { type: "boolean" }
   | { type: "string" }
   | { type: "bytes" }
+  | { type: "function" }
   | { type: "any" }
   | {
       type: "literal";
@@ -1286,6 +1287,14 @@ function validateValidator(validator: ValidatorJSON, value: any) {
       if (!(value instanceof ArrayBuffer)) {
         throw new Error(
           `Validator error: Expected \`ArrayBuffer\`, got \`${value}\``,
+        );
+      }
+      return;
+    }
+    case "function": {
+      if (typeof value !== "string" || !value.startsWith("function://")) {
+        throw new Error(
+          `Validator error: Expected \`v.function()\`, got \`${value}\``,
         );
       }
       return;

@@ -16,6 +16,7 @@ import type * as commitTs from "../commitTs.js";
 import type * as component from "../component.js";
 import type * as convexError from "../convexError.js";
 import type * as explicitTableNames from "../explicitTableNames.js";
+import type * as functionValidator from "../functionValidator.js";
 import type * as getDeploymentMetadata from "../getDeploymentMetadata.js";
 import type * as getFunctionMetadata from "../getFunctionMetadata.js";
 import type * as helpers from "../helpers.js";
@@ -46,6 +47,7 @@ declare const fullApi: ApiFromModules<{
   component: typeof component;
   convexError: typeof convexError;
   explicitTableNames: typeof explicitTableNames;
+  functionValidator: typeof functionValidator;
   getDeploymentMetadata: typeof getDeploymentMetadata;
   getFunctionMetadata: typeof getFunctionMetadata;
   helpers: typeof helpers;

@@ -9,6 +9,9 @@ export default defineSchema({
     nested: v.optional(v.object({ commitTs: v.commitTs() })),
     other: v.optional(v.string()),
   }).index("by_commit_ts", ["commitTs"]),
+  functionHandles: defineTable({
+    handle: v.function(),
+  }),
   messages: defineTable({
     author: v.string(),
     body: v.string(),
