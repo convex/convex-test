@@ -1294,6 +1294,50 @@ type ValidatorJSON =
   | { type: "object"; value: Record<string, ObjectFieldType> }
   | { type: "union"; value: ValidatorJSON[] };
 
+// True only where `validateValidator(validator, value)` would certainly throw,
+// so a union can skip that branch without building and catching an Error.
+function cannotMatch(validator: ValidatorJSON, value: any): boolean {
+  switch (validator.type) {
+    case "literal":
+      return value !== validator.value;
+    case "null":
+      return value !== null;
+    case "string":
+    case "id":
+      return typeof value !== "string";
+    case "number":
+    case "bigint":
+    case "boolean":
+      return typeof value !== validator.type;
+    case "array":
+      return !Array.isArray(value);
+    case "object": {
+      if (
+        value === null ||
+        typeof value !== "object" ||
+        !isSimpleObject(value)
+      ) {
+        return true;
+      }
+      // Discriminated unions: a required literal field that differs rules
+      // the branch out.
+      for (const k in validator.value) {
+        const { fieldType, optional } = validator.value[k];
+        if (fieldType.type !== "literal") {
+          continue;
+        }
+        const field = value[k];
+        if (field === undefined ? !optional : field !== fieldType.value) {
+          return true;
+        }
+      }
+      return false;
+    }
+    default:
+      return false;
+  }
+}
+
 function validateValidator(validator: ValidatorJSON, value: any) {
   switch (validator.type) {
     case "null": {
@@ -1393,6 +1437,9 @@ function validateValidator(validator: ValidatorJSON, value: any) {
     case "union": {
       let isValid = false;
       for (const v of validator.value) {
+        if (cannotMatch(v, value)) {
+          continue;
+        }
         try {
           validateValidator(v, value);
           isValid = true;
