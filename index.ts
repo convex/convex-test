@@ -688,12 +688,19 @@ class DatabaseFake {
     tableName: string,
     callback: (doc: GenericDocument) => void,
   ) {
-    const isInTable = (id: string) => tableNameFromId(id) === tableName;
-    const ids = new Set<string>(this._tableIds.get(tableName));
-    for (let i = 0; i < this._writes.length; i++) {
-      for (const id of Object.keys(this._writes[i]).filter(isInTable)) {
-        ids.add(id);
+    const committed = this._tableIds.get(tableName);
+    let ids: Iterable<string> = committed ?? [];
+    if (this._writes.length > 0) {
+      // Merge pending writes; the committed set is copied only then.
+      const merged = new Set<string>(committed);
+      for (let i = 0; i < this._writes.length; i++) {
+        for (const id in this._writes[i]) {
+          if (isIdInTable(id, tableName)) {
+            merged.add(id);
+          }
+        }
       }
+      ids = merged;
     }
     for (const id of ids) {
       const document = this.get(tableName, id as DocumentId);
@@ -895,6 +902,22 @@ class DatabaseFake {
   get componentPath() {
     return this._componentPath;
   }
+}
+
+// Same result as `tableNameFromId(id) === tableName`, without a regex match
+// or a slice for ids of other tables. Table names never start with a digit.
+function isIdInTable(id: string, tableName: string) {
+  const prefixLength = id.length - tableName.length;
+  if (prefixLength <= 0 || !id.endsWith(tableName)) {
+    return false;
+  }
+  for (let i = 0; i < prefixLength; i++) {
+    const c = id.charCodeAt(i);
+    if (c < 48 || c > 57) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function tableNameFromId(id: string) {
