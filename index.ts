@@ -42,6 +42,7 @@ import {
   queryGeneric,
 } from "convex/server";
 import {
+  Base64,
   CommitTsPlaceholder,
   GenericId,
   JSONValue,
@@ -181,6 +182,10 @@ class DatabaseFake {
   //   database.
   // - When a mutation is rolled back, last level of writes is discarded.
   private _writes: Array<Record<DocumentId, StoredDocument | null>> = [];
+  // Files stored at each level of `_writes`, staged the same way so a
+  // rolled-back mutation's files are discarded along with their `_storage`
+  // documents.
+  private _pendingFiles: Array<Map<DocumentId, Blob>> = [];
 
   private _schema: {
     schemaValidation: boolean;
@@ -218,6 +223,7 @@ class DatabaseFake {
   // Called by TransactionManager.begin.
   startTransaction() {
     this._writes.push({});
+    this._pendingFiles.push(new Map());
   }
 
   get<Table extends TableName>(
@@ -249,14 +255,32 @@ class DatabaseFake {
   }
 
   storeFile(storageId: GenericId<"_storage">, blob: Blob) {
-    this._storage[storageId] = blob;
+    if (this._pendingFiles.length === 0) {
+      throw new Error(`File stored outside of transaction ${storageId}`);
+    }
+    this._pendingFiles[this._pendingFiles.length - 1].set(storageId, blob);
   }
 
   getFile(storageId: GenericId<"_storage">) {
     if (this.get("_storage", storageId) === null) {
       return null;
     }
-    return this._storage[storageId];
+    return this._pendingFile(storageId) ?? this._storage[storageId];
+  }
+
+  // Whether the file was stored by the current transaction.
+  isPendingFile(storageId: GenericId<"_storage">) {
+    return this._pendingFile(storageId) !== undefined;
+  }
+
+  private _pendingFile(storageId: GenericId<"_storage">) {
+    for (let i = this._pendingFiles.length - 1; i >= 0; i--) {
+      const file = this._pendingFiles[i].get(storageId);
+      if (file !== undefined) {
+        return file;
+      }
+    }
+    return undefined;
   }
 
   private _addWrite(id: DocumentId, newValue: StoredDocument | null) {
@@ -425,6 +449,7 @@ class DatabaseFake {
         const tableName = tableNameFromId(_id)!;
         if (write === null) {
           delete this._documents[_id];
+          delete this._storage[_id];
           this._tableIds.get(tableName)?.delete(_id);
         } else {
           this._documents[_id] =
@@ -440,6 +465,18 @@ class DatabaseFake {
         this._addWrite(_id, write);
       }
     }
+    const lastFiles = this._pendingFiles.pop()!;
+    for (const [id, file] of lastFiles) {
+      // Drop files whose `_storage` document was deleted before commit.
+      if (this.get("_storage", id as GenericId<"_storage">) === null) {
+        continue;
+      }
+      if (this._pendingFiles.length === 0) {
+        this._storage[id] = file;
+      } else {
+        this.storeFile(id as GenericId<"_storage">, file);
+      }
+    }
   }
 
   rollbackWrites() {
@@ -447,6 +484,7 @@ class DatabaseFake {
       throw new Error("Transaction already committed or rolled back");
     }
     this._writes.pop();
+    this._pendingFiles.pop();
   }
 
   // Temporarily hide all pending writes so reads only see committed state.
@@ -2131,6 +2169,10 @@ function asyncSyscallImpl() {
       }
       case "1.0/storageDelete": {
         const { storageId } = args;
+        const metadata = db.get("_storage", storageId);
+        if (metadata !== null && db.isPendingFile(storageId)) {
+          tracker?.untrackFileWrite(metadata.size as number);
+        }
         await writeToDatabase(async (db) => {
           db.delete("_storage", storageId);
         });
@@ -2148,6 +2190,47 @@ function asyncSyscallImpl() {
           "https://some-deployment.convex.cloud/api/storage/" +
           (sha256 as string);
         return JSON.stringify(convexToJson(url));
+      }
+      case "1.0/storageStore": {
+        const { blob, contentType, sha256: expectedSha256 } = args;
+        const bytes = Base64.toByteArray(blob) as Uint8Array<ArrayBuffer>;
+        const type = contentType || undefined;
+        const file = new Blob([bytes], { type });
+        const sha256 = await blobSha(file);
+        if (expectedSha256 != null && expectedSha256 !== sha256) {
+          throw new Error(
+            `Sha256 mismatch. Expected: ${expectedSha256} Actual: ${sha256}`,
+          );
+        }
+        tracker?.trackFileWrite(bytes.length);
+        const storageId = await writeToDatabase(async (db) => {
+          const storageId = db.insert("_storage", {
+            size: bytes.length,
+            sha256,
+            ...(type !== undefined ? { contentType: type } : {}),
+          });
+          db.storeFile(storageId, file);
+          return storageId;
+        });
+        return JSON.stringify(convexToJson(storageId));
+      }
+      case "1.0/storageGet": {
+        const { storageId } = args;
+        const file = db.getFile(storageId);
+        if (file == null) {
+          return JSON.stringify(null);
+        }
+        const metadata = db.get("_storage", storageId)!;
+        const fileKey = `${db.componentPath}:${storageId}`;
+        const filesRead = getTransactionManager().getFilesRead();
+        if (!db.isPendingFile(storageId) && !filesRead.has(fileKey)) {
+          tracker?.trackFileRead(metadata.size as number);
+          filesRead.add(fileKey);
+        }
+        return JSON.stringify({
+          blob: Base64.fromByteArray(new Uint8Array(await file.arrayBuffer())),
+          contentType: metadata.contentType ?? null,
+        });
       }
       case "1.0/storageGenerateUploadUrl": {
         // In the real backend the token is cryptographically secure
@@ -2191,15 +2274,15 @@ function jsSyscallImpl() {
     switch (op) {
       case "storage/storeBlob": {
         const { blob } = args as { blob: Blob };
-        const storageId = await writeToDatabase(async (db) => {
-          return db.insert("_storage", {
+        return await writeToDatabase(async (db) => {
+          const storageId = db.insert("_storage", {
             size: blob.size,
             sha256: await blobSha(blob),
             ...(blob.type ? { contentType: blob.type } : {}),
           });
+          db.storeFile(storageId, blob);
+          return storageId;
         });
-        db.storeFile(storageId, blob);
-        return storageId;
       }
       case "storage/getBlob": {
         const { storageId } = args as { storageId: GenericId<"_storage"> };
@@ -3155,6 +3238,10 @@ class TransactionManager {
   private _lastCommitTs: bigint = 0n;
   // Milliseconds pinned at top-level transaction start, shared by nested calls.
   private _udfTime: number | null = null;
+  // Files already read by the current top-level transaction, including by
+  // nested calls that rolled back. Reading one again doesn't count toward the
+  // read limits.
+  private _filesRead: Set<string> | null = null;
 
   constructor(limitsConfig: Partial<TransactionMetrics> | boolean = false) {
     this._limitsConfig = limitsConfig;
@@ -3185,6 +3272,7 @@ class TransactionManager {
         this._markTransactionDone = resolve;
       });
       this._metricsTracker = new TransactionMetricsTracker(this._limitsConfig);
+      this._filesRead = new Set();
     }
     const convex = getConvexGlobal();
     for (const component of Object.values(convex.components)) {
@@ -3202,6 +3290,13 @@ class TransactionManager {
   // The metrics tracker, or null when not inside a transaction.
   getMetricsTracker(): TransactionMetricsTracker | null {
     return this._metricsTracker;
+  }
+
+  getFilesRead(): Set<string> {
+    if (this._filesRead === null) {
+      throw new Error("Transaction not started");
+    }
+    return this._filesRead;
   }
 
   getTime(): number {
@@ -3259,6 +3354,7 @@ class TransactionManager {
     if (!isNested) {
       this._udfTime = null;
       this._metricsTracker = null;
+      this._filesRead = null;
       this._waitOnCurrentFunction = null;
       this._markTransactionDone();
       this._markTransactionDone = null;

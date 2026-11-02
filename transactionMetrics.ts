@@ -6,6 +6,10 @@ export type TransactionMetrics = {
   documentsWritten: number;
   functionsScheduled: number;
   scheduledFunctionArgsBytes: number;
+  filesWritten: number;
+  fileWriteBytes: number;
+  filesRead: number;
+  fileReadBytes: number;
 };
 
 // Metrics that track reads. On rollback these are still folded into the
@@ -15,6 +19,8 @@ const READ_METRIC_KEYS: (keyof TransactionMetrics)[] = [
   "bytesRead",
   "documentsRead",
   "databaseQueries",
+  "filesRead",
+  "fileReadBytes",
 ];
 
 const MiB = 1 << 20;
@@ -27,6 +33,10 @@ const DEFAULT_TRANSACTION_LIMITS: TransactionMetrics = {
   documentsWritten: 16_000,
   functionsScheduled: 1000,
   scheduledFunctionArgsBytes: 16 * MiB,
+  filesWritten: 10,
+  fileWriteBytes: 16 * MiB,
+  filesRead: 10,
+  fileReadBytes: 16 * MiB,
 };
 
 function zeroMetrics(): TransactionMetrics {
@@ -38,6 +48,10 @@ function zeroMetrics(): TransactionMetrics {
     databaseQueries: 0,
     functionsScheduled: 0,
     scheduledFunctionArgsBytes: 0,
+    filesWritten: 0,
+    fileWriteBytes: 0,
+    filesRead: 0,
+    fileReadBytes: 0,
   };
 }
 
@@ -196,6 +210,70 @@ export class TransactionMetricsTracker {
     }
   }
 
+  // Unlike the other limits, the file limits are checked before counting the
+  // new file, matching the backend, so a caught error leaves usage unchanged.
+  trackFileWrite(sizeBytes: number) {
+    const layer = this._current();
+    if (layer === undefined) {
+      return;
+    }
+    if (layer.enforce) {
+      if (layer.metrics.filesWritten >= layer.limits.filesWritten) {
+        throw new Error(
+          `Too many files stored by this mutation (limit: ${layer.limits.filesWritten}). ` +
+            `This is a Convex limit: https://docs.convex.dev/production/state/limits`,
+        );
+      }
+      if (
+        layer.metrics.fileWriteBytes + sizeBytes >
+        layer.limits.fileWriteBytes
+      ) {
+        throw new Error(
+          `Too large total size of the files stored by this mutation (limit: ${layer.limits.fileWriteBytes} bytes). ` +
+            `This is a Convex limit: https://docs.convex.dev/production/state/limits`,
+        );
+      }
+    }
+    layer.metrics.filesWritten += 1;
+    layer.metrics.fileWriteBytes += sizeBytes;
+  }
+
+  // Deleting a file this transaction stored gives back its write budget.
+  untrackFileWrite(sizeBytes: number) {
+    const layer = this._current();
+    if (layer === undefined) {
+      return;
+    }
+    layer.metrics.filesWritten -= 1;
+    layer.metrics.fileWriteBytes -= sizeBytes;
+  }
+
+  trackFileRead(sizeBytes: number) {
+    const layer = this._current();
+    if (layer === undefined) {
+      return;
+    }
+    if (layer.enforce) {
+      if (layer.metrics.filesRead >= layer.limits.filesRead) {
+        throw new Error(
+          `Too many files read by this mutation (limit: ${layer.limits.filesRead}). ` +
+            `This is a Convex limit: https://docs.convex.dev/production/state/limits`,
+        );
+      }
+      if (
+        layer.metrics.fileReadBytes + sizeBytes >
+        layer.limits.fileReadBytes
+      ) {
+        throw new Error(
+          `Too large total size of the files read by this mutation (limit: ${layer.limits.fileReadBytes} bytes). ` +
+            `This is a Convex limit: https://docs.convex.dev/production/state/limits`,
+        );
+      }
+    }
+    layer.metrics.filesRead += 1;
+    layer.metrics.fileReadBytes += sizeBytes;
+  }
+
   getTransactionMetrics() {
     const layer = this._current();
     if (layer === undefined) {
@@ -232,6 +310,22 @@ export class TransactionMetricsTracker {
         remaining:
           limits.scheduledFunctionArgsBytes -
           metrics.scheduledFunctionArgsBytes,
+      },
+      filesWritten: {
+        used: metrics.filesWritten,
+        remaining: limits.filesWritten - metrics.filesWritten,
+      },
+      fileWriteBytes: {
+        used: metrics.fileWriteBytes,
+        remaining: limits.fileWriteBytes - metrics.fileWriteBytes,
+      },
+      filesRead: {
+        used: metrics.filesRead,
+        remaining: limits.filesRead - metrics.filesRead,
+      },
+      fileReadBytes: {
+        used: metrics.fileReadBytes,
+        remaining: limits.fileReadBytes - metrics.fileReadBytes,
       },
     };
   }
