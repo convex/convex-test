@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.67
+
+- Adds support for file storage access in mutations.
+
 ## 0.0.66
 
 - perf: only visit the queried table's documents in \_iterateDocs (#154)
