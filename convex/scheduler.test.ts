@@ -112,6 +112,66 @@ describe("with fake timers", () => {
     expect(result).toMatchObject([]);
   });
 
+  // setTimeout can't wait longer than 2^31-1 ms (about 24.8 days).
+  const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+
+  test("function scheduled more than 24.8 days ahead waits until its time", async () => {
+    const t = convexTest(schema);
+    await t.mutation(api.scheduler.mutationSchedulingAction, {
+      delayMs: thirtyDays,
+      body: "far future",
+    });
+
+    vi.advanceTimersByTime(5);
+    await t.finishInProgressScheduledFunctions();
+    {
+      const jobs = await t.query(internal.scheduler.jobs);
+      expect(jobs).toMatchObject([{ state: { kind: "pending" } }]);
+    }
+
+    // 1 ms before the due time.
+    vi.advanceTimersByTime(thirtyDays - 6);
+    await t.finishInProgressScheduledFunctions();
+    {
+      const jobs = await t.query(internal.scheduler.jobs);
+      expect(jobs).toMatchObject([{ state: { kind: "pending" } }]);
+    }
+
+    vi.advanceTimersByTime(1);
+    await t.finishInProgressScheduledFunctions();
+    {
+      const jobs = await t.query(internal.scheduler.jobs);
+      expect(jobs).toMatchObject([{ state: { kind: "success" } }]);
+    }
+    const result = await t.query(internal.scheduler.list);
+    expect(result).toMatchObject([{ body: "far future", author: "AI" }]);
+  });
+
+  test("finishAllScheduledFunctions runs a function scheduled more than 24.8 days ahead", async () => {
+    const t = convexTest(schema);
+    await t.mutation(api.scheduler.mutationSchedulingAction, {
+      delayMs: thirtyDays,
+      body: "far future",
+    });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    const result = await t.query(internal.scheduler.list);
+    expect(result).toMatchObject([{ body: "far future", author: "AI" }]);
+  });
+
+  test("canceled function scheduled more than 24.8 days ahead does not run", async () => {
+    const t = convexTest(schema);
+    const id = await t.mutation(api.scheduler.mutationSchedulingAction, {
+      delayMs: thirtyDays,
+      body: "far future",
+    });
+    await t.mutation(api.scheduler.cancel, { id });
+    await t.finishAllScheduledFunctions(vi.runAllTimers);
+    const jobs = await t.query(internal.scheduler.jobs);
+    expect(jobs).toMatchObject([{ state: { kind: "canceled" } }]);
+    const result = await t.query(internal.scheduler.list);
+    expect(result).toMatchObject([]);
+  });
+
   test("action scheduling action", async () => {
     const t = convexTest(schema);
     await t.action(api.scheduler.actionSchedulingAction, {

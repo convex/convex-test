@@ -2116,7 +2116,7 @@ function asyncSyscallImpl() {
         // rather than inheriting a stale parent lock.
         nestedTxStorage.exit(() => {
           scheduler.timerScheduled();
-          frameworkSetTimeout(
+          frameworkSetTimeoutAt(
             () => {
               scheduler.timerFired();
               const promise = convexGlobalStorage
@@ -2137,7 +2137,7 @@ function asyncSyscallImpl() {
             },
             // Like the backend's scheduler, measure the due time against the
             // wall clock, not the scheduling transaction's pinned time.
-            Math.max(0, tsInSecs * 1000 - frameworkNow()),
+            tsInSecs * 1000,
           );
         });
         return JSON.stringify(convexToJson(jobId));
@@ -3018,6 +3018,23 @@ function frameworkSetTimeout(
   ms?: number,
 ): ReturnType<typeof setTimeout> {
   return globalOverridesStorage.exit(() => globalThis.setTimeout(cb, ms));
+}
+
+// setTimeout fires after 1 ms when given a delay above 2^31-1 ms (about 24.8
+// days). Wait in steps of at most that long, measuring the remaining time
+// against `frameworkNow()` before each step.
+const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+
+function frameworkSetTimeoutAt(cb: () => void, dueAtMs: number): void {
+  const delay = Math.max(0, dueAtMs - frameworkNow());
+  if (delay <= MAX_TIMER_DELAY_MS) {
+    frameworkSetTimeout(cb, delay);
+  } else {
+    frameworkSetTimeout(
+      () => frameworkSetTimeoutAt(cb, dueAtMs),
+      MAX_TIMER_DELAY_MS,
+    );
+  }
 }
 
 // Globals that the real Convex runtime does not provide inside queries and
