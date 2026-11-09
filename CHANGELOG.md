@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.69
+
+- Fix storage writes in actions joining an unrelated transaction. A
+  `ctx.storage.store` call in an action could fail with
+  `Write outside of transaction`, and an unrelated rollback could undo
+  `ctx.storage.delete`. Storage writes now only reuse a transaction owned by
+  the current invocation. (#151, thanks @delbyte!)
+
+## 0.0.68
+
+- This release was mistakenly published with outdated compiler output and is
+  deprecated. Use 0.0.69 instead.
+
 ## 0.0.67
 
 - Adds support for file storage access in mutations.
