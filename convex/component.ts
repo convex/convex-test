@@ -268,3 +268,12 @@ export const writeCommitTsAcrossComponents = internalMutation({
     return id;
   },
 });
+
+export const paginateInComponent = internalQuery({
+  args: {},
+  handler: async (ctx, _args) => {
+    return await ctx.runQuery(components.counter.public.paginate, {
+      paginationOpts: { numItems: 10, cursor: null },
+    });
+  },
+});

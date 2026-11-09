@@ -31,6 +31,7 @@ import type * as requestMetadata from "../requestMetadata.js";
 import type * as requestMetadataNode from "../requestMetadataNode.js";
 import type * as returnsValidation from "../returnsValidation.js";
 import type * as scheduler from "../scheduler.js";
+import type * as signJwt from "../signJwt.js";
 import type * as storage from "../storage.js";
 import type * as textSearch from "../textSearch.js";
 import type * as vectorSearch from "../vectorSearch.js";
@@ -65,6 +66,7 @@ declare const fullApi: ApiFromModules<{
   requestMetadataNode: typeof requestMetadataNode;
   returnsValidation: typeof returnsValidation;
   scheduler: typeof scheduler;
+  signJwt: typeof signJwt;
   storage: typeof storage;
   textSearch: typeof textSearch;
   vectorSearch: typeof vectorSearch;

@@ -5,6 +5,7 @@ import { convexTest } from "../index";
 import schema from "./schema";
 import { components, internal } from "./_generated/api";
 import counterSchema from "./counter/component/schema";
+import type { QueryCtx } from "./_generated/server";
 
 const counterModules = import.meta.glob("./counter/component/**/*.ts");
 
@@ -273,3 +274,65 @@ test("parallel mutations on different components", async () => {
   expect(count1).toEqual(1);
   expect(count2).toEqual(1);
 });
+
+test("components can paginate directly and from an app query", async () => {
+  const t = testWithCounter();
+  await t.mutation(components.counter.public.add, { name: "beans", count: 3 });
+  const direct = await t.query(components.counter.public.paginate, {
+    paginationOpts: { numItems: 10, cursor: null },
+  });
+  expect(direct.page).toMatchObject([{ name: "beans", value: 3 }]);
+  expect(direct.isDone).toBe(true);
+  const nested = await t.query(internal.component.paginateInComponent);
+  expect(nested).toEqual(direct);
+});
+
+test.each(["query", "mutation", "run"] as const)(
+  "app and component pagination in a %s",
+  async (udfType) => {
+    const t = testWithCounter();
+    for (const componentFirst of [false, true]) {
+      const handler = async (ctx: QueryCtx) => {
+        const app = () =>
+          ctx.db.query("messages").paginate({ numItems: 10, cursor: null });
+        const component = () =>
+          ctx.runQuery(components.counter.public.paginate, {
+            paginationOpts: { numItems: 10, cursor: null },
+          });
+        await (componentFirst ? component() : app());
+        await (componentFirst ? app() : component());
+      };
+      if (udfType === "query") {
+        await expect(t.query(handler)).rejects.toThrow(
+          /single paginated query.*per query/,
+        );
+      } else {
+        await expect(
+          udfType === "mutation" ? t.mutation(handler) : t.run(handler),
+        ).resolves.toBeNull();
+      }
+    }
+  },
+);
+
+test.each(["query", "mutation"] as const)(
+  "pagination in different components called from a %s",
+  async (udfType) => {
+    const t = testWithTwoCounters();
+    const handler = async (ctx: QueryCtx) => {
+      await ctx.runQuery(components.counter.public.paginate, {
+        paginationOpts: { numItems: 10, cursor: null },
+      });
+      await ctx.runQuery(components.counter2.public.paginate, {
+        paginationOpts: { numItems: 10, cursor: null },
+      });
+    };
+    if (udfType === "query") {
+      await expect(t.query(handler)).rejects.toThrow(
+        /single paginated query.*per query/,
+      );
+    } else {
+      await expect(t.mutation(handler)).resolves.toBeNull();
+    }
+  },
+);

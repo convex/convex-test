@@ -2,9 +2,12 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import {
+  ActionBuilder,
+  ApiFromModules,
   DataModelFromSchemaDefinition,
   DefaultFunctionArgs,
   DocumentByName,
+  FilterApi,
   FunctionReference,
   FunctionReturnType,
   GenericActionCtx,
@@ -14,8 +17,10 @@ import {
   GenericQueryCtx,
   GenericSchema,
   HttpRouter,
+  MutationBuilder,
   OptionalRestArgs,
   PublicHttpAction,
+  QueryBuilder,
   RegisteredAction,
   RegisteredMutation,
   RegisteredQuery,
@@ -24,13 +29,20 @@ import {
   SystemDataModel,
   UserIdentity,
   actionGeneric,
+  anyApi,
+  componentsGeneric,
+  filterApi,
   getFunctionAddress,
   httpActionGeneric,
+  internalActionGeneric,
+  internalMutationGeneric,
+  internalQueryGeneric,
   makeFunctionReference,
   mutationGeneric,
   queryGeneric,
 } from "convex/server";
 import {
+  Base64,
   CommitTsPlaceholder,
   GenericId,
   JSONValue,
@@ -49,6 +61,7 @@ import {
 // Real Convex IDs are 32 characters. IDs may exceed this length for very long
 // table names or large numbers of documents, but this is the typical target.
 const TYPICAL_CONVEX_ID_LENGTH = 32;
+const MAX_SEARCH_CANDIDATE_REVISIONS = 1024;
 
 type FilterJson =
   | { $eq: [FilterJson, FilterJson] }
@@ -156,11 +169,15 @@ const convexGlobalStorage = new AsyncLocalStorage<ConvexGlobal>();
 class DatabaseFake {
   private _componentPath: string;
   private _documents: Record<DocumentId, StoredDocument> = {};
+  // Ids of committed documents, grouped by table name, so queries only
+  // visit documents in the table they read from. Kept in sync with
+  // `_documents` in `commit`.
+  private _tableIds: Map<string, Set<DocumentId>> = new Map();
   private _storage: Record<DocumentId, Blob> = {};
   private _nextQueryId: QueryId = 1;
   private _nextDocId: number = 10000;
   private _lastCreationTime: number = 0;
-  private _queryResults: Record<QueryId, Array<GenericDocument>> = {};
+  private _queryResults: Record<QueryId, Iterator<GenericDocument>> = {};
   // Pending writes for each level of transaction nesting.
   // Whenever a child mutation begins, a new level is created for all
   // components.
@@ -171,6 +188,10 @@ class DatabaseFake {
   //   database.
   // - When a mutation is rolled back, last level of writes is discarded.
   private _writes: Array<Record<DocumentId, StoredDocument | null>> = [];
+  // Files stored at each level of `_writes`, staged the same way so a
+  // rolled-back mutation's files are discarded along with their `_storage`
+  // documents.
+  private _pendingFiles: Array<Map<DocumentId, Blob>> = [];
 
   private _schema: {
     schemaValidation: boolean;
@@ -208,6 +229,7 @@ class DatabaseFake {
   // Called by TransactionManager.begin.
   startTransaction() {
     this._writes.push({});
+    this._pendingFiles.push(new Map());
   }
 
   get<Table extends TableName>(
@@ -239,14 +261,32 @@ class DatabaseFake {
   }
 
   storeFile(storageId: GenericId<"_storage">, blob: Blob) {
-    this._storage[storageId] = blob;
+    if (this._pendingFiles.length === 0) {
+      throw new Error(`File stored outside of transaction ${storageId}`);
+    }
+    this._pendingFiles[this._pendingFiles.length - 1].set(storageId, blob);
   }
 
   getFile(storageId: GenericId<"_storage">) {
     if (this.get("_storage", storageId) === null) {
       return null;
     }
-    return this._storage[storageId];
+    return this._pendingFile(storageId) ?? this._storage[storageId];
+  }
+
+  // Whether the file was stored by the current transaction.
+  isPendingFile(storageId: GenericId<"_storage">) {
+    return this._pendingFile(storageId) !== undefined;
+  }
+
+  private _pendingFile(storageId: GenericId<"_storage">) {
+    for (let i = this._pendingFiles.length - 1; i >= 0; i--) {
+      const file = this._pendingFiles[i].get(storageId);
+      if (file !== undefined) {
+        return file;
+      }
+    }
+    return undefined;
   }
 
   private _addWrite(id: DocumentId, newValue: StoredDocument | null) {
@@ -412,14 +452,35 @@ class DatabaseFake {
     for (const [id, write] of Object.entries(lastWrites)) {
       const _id = id as DocumentId;
       if (this._writes.length === 0) {
+        const tableName = tableNameFromId(_id)!;
         if (write === null) {
           delete this._documents[_id];
+          delete this._storage[_id];
+          this._tableIds.get(tableName)?.delete(_id);
         } else {
           this._documents[_id] =
             commitTs === null ? write : resolveCommittedValues(write, commitTs);
+          let tableIds = this._tableIds.get(tableName);
+          if (tableIds === undefined) {
+            tableIds = new Set();
+            this._tableIds.set(tableName, tableIds);
+          }
+          tableIds.add(_id);
         }
       } else {
         this._addWrite(_id, write);
+      }
+    }
+    const lastFiles = this._pendingFiles.pop()!;
+    for (const [id, file] of lastFiles) {
+      // Drop files whose `_storage` document was deleted before commit.
+      if (this.get("_storage", id as GenericId<"_storage">) === null) {
+        continue;
+      }
+      if (this._pendingFiles.length === 0) {
+        this._storage[id] = file;
+      } else {
+        this.storeFile(id as GenericId<"_storage">, file);
       }
     }
   }
@@ -429,6 +490,7 @@ class DatabaseFake {
       throw new Error("Transaction already committed or rolled back");
     }
     this._writes.pop();
+    this._pendingFiles.pop();
   }
 
   // Temporarily hide all pending writes so reads only see committed state.
@@ -468,10 +530,11 @@ class DatabaseFake {
     if (results === undefined) {
       throw new Error("Bad queryId");
     }
-    if (results.length === 0) {
+    const { value, done } = results.next();
+    if (done) {
       return { value: null, done: true };
     } else {
-      return { value: results.shift()!, done: false };
+      return { value, done: false };
     }
   }
 
@@ -548,6 +611,7 @@ class DatabaseFake {
     let pageStatus: "SplitRecommended" | "SplitRequired" | null = null;
     let rowsRead = 0;
     let bytesRead = 0;
+    let stoppedAtLimit = false;
     const readDocCursors: string[] = [];
 
     for (let i = 0; i < sortedDocs.length; i++) {
@@ -569,6 +633,8 @@ class DatabaseFake {
           }
         }
       }
+
+      checkSearchCandidateLimit(query.source, rowsRead);
 
       // endCursor: stop when we reach or pass this position (inclusive boundary)
       if (hasEndBoundary && endCursorKeys) {
@@ -613,10 +679,12 @@ class DatabaseFake {
       if (hitLimit) {
         pageStatus = "SplitRequired";
         continueCursor = this._encodeCursor(doc, cursorFields);
+        stoppedAtLimit = true;
         break;
       }
 
       if (!endCursor && page.length >= pageSize) {
+        stoppedAtLimit = true;
         if (isLastDoc) {
           // No more docs — don't set continueCursor so isDone becomes true
         } else {
@@ -624,6 +692,12 @@ class DatabaseFake {
         }
         break;
       }
+    }
+
+    // Exhausting the source (including an endCursor-bounded range) requires
+    // another read. Like streaming queries, check the cap before exhaustion.
+    if (!stoppedAtLimit) {
+      checkSearchCandidateLimit(query.source, rowsRead);
     }
 
     if (continueCursor === "_end_cursor") {
@@ -659,7 +733,7 @@ class DatabaseFake {
     callback: (doc: GenericDocument) => void,
   ) {
     const isInTable = (id: string) => tableNameFromId(id) === tableName;
-    const ids = new Set(Object.keys(this._documents).filter(isInTable));
+    const ids = new Set<string>(this._tableIds.get(tableName));
     for (let i = 0; i < this._writes.length; i++) {
       for (const id of Object.keys(this._writes[i]).filter(isInTable)) {
         ids.add(id);
@@ -787,13 +861,26 @@ class DatabaseFake {
     };
   }
 
-  private _evaluateQuery(query: SerializedQuery): Array<GenericDocument> {
+  private _evaluateQuery(query: SerializedQuery): Iterator<GenericDocument> {
     const { sortedDocs, filterFn, limit } = this._resolveQuerySource(query);
-    let results = sortedDocs.filter(filterFn);
-    if (limit !== null) {
-      results = results.slice(0, limit);
-    }
-    return results;
+    // Snapshot the source above, but consume candidates lazily so take() and
+    // early exits from iteration don't scan past the search limit.
+    return (function* () {
+      let scanned = 0;
+      let returned = 0;
+      while (limit === null || returned < limit) {
+        // Like the backend, check before testing for exhaustion and before
+        // applying post-search filters. Search index equality filters have
+        // already been applied by _resolveQuerySource().
+        checkSearchCandidateLimit(query.source, scanned);
+        if (scanned === sortedDocs.length) return;
+        const doc = sortedDocs[scanned++];
+        if (filterFn(doc)) {
+          returned++;
+          yield doc;
+        }
+      }
+    })();
   }
 
   vectorSearch(
@@ -1086,6 +1173,16 @@ function evaluateQueryValue(value: JSONValue) {
     : resolvePendingValues(evaluatedValue);
 }
 
+function checkSearchCandidateLimit(source: Source, scanned: number) {
+  if (source.type === "Search" && scanned >= MAX_SEARCH_CANDIDATE_REVISIONS) {
+    throw new Error(
+      `Search query scanned too many documents (fetched ${MAX_SEARCH_CANDIDATE_REVISIONS}). ` +
+        "Consider using a smaller limit, paginating the query, or using a filter " +
+        "field to limit the number of documents pulled from the search index.",
+    );
+  }
+}
+
 function evaluateSearchFilter(
   document: GenericDocument,
   filter: SerializedSearchFilter,
@@ -1095,11 +1192,14 @@ function evaluateSearchFilter(
     case "Eq":
       return compareValues(result, evaluateQueryValue(filter.value)) === 0;
     case "Search": {
+      if (typeof result !== "string") {
+        return false;
+      }
       const queryTerms = filter.value
         .toLowerCase()
         .split(/\s+/)
         .filter((term) => term.length > 0);
-      const documentWords = (result as string)
+      const documentWords = result
         .split(/\s+/)
         .map((word) => word.toLowerCase());
       return queryTerms.some((queryTerm) =>
@@ -1465,7 +1565,10 @@ const JWT_CLAIM_BY_IDENTITY_ATTRIBUTE: Record<string, string> = {
 };
 
 function base64UrlEncode(value: string) {
-  const bytes = new TextEncoder().encode(value);
+  return base64UrlEncodeBytes(new TextEncoder().encode(value));
+}
+
+function base64UrlEncodeBytes(bytes: Uint8Array) {
   let binary = "";
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);
@@ -1497,6 +1600,159 @@ function createTestJwt(identity: Record<string, any>) {
   const header = base64UrlEncode(JSON.stringify({ alg: "none", typ: "JWT" }));
   const payload = base64UrlEncode(JSON.stringify(claims));
   return `${header}.${payload}.`;
+}
+
+// Limits the backend puts on tokens from `ctx.auth.signJwt`.
+const DEPLOYMENT_JWT_MAX_LIFETIME_SECONDS = 60 * 60;
+const DEPLOYMENT_JWT_MAX_SIZE = 8000;
+const RESERVED_JWT_CLAIM_PREFIXES = ["convex", "cvx"];
+// Used as the `iss` origin when the test environment doesn't set
+// `CONVEX_CLOUD_URL`, which the backend always does.
+const DEFAULT_CONVEX_CLOUD_URL = "https://some-deployment.convex.cloud";
+
+// `ctx.auth` in mutations, which can also sign JWTs with the deployment's key.
+function mutationAuth(auth: AuthFake) {
+  return {
+    getUserIdentity: () => auth.getUserIdentity(),
+    signJwt: (options: any) => signDeploymentJwt(options),
+  };
+}
+
+// Mirrors the backend's `ctx.auth.signJwt`, including its validation. Tokens
+// are signed with a key generated for the `convexTest` instance rather than
+// the deployment's key.
+async function signDeploymentJwt(options: any): Promise<string> {
+  // On the backend the options cross the syscall boundary as JSON.
+  const { claims = {}, expiresInSeconds } = JSON.parse(
+    JSON.stringify(options ?? {}),
+  );
+  if (typeof claims !== "object" || claims === null || Array.isArray(claims)) {
+    throw new Error(
+      "Invalid arguments for auth.signJwt: claims must be an object",
+    );
+  }
+  if (typeof expiresInSeconds !== "number" || expiresInSeconds < 1) {
+    throw new Error(
+      "Invalid arguments for auth.signJwt: expiresInSeconds must be a number of seconds, at least 1",
+    );
+  }
+  for (const reserved of ["iss", "iat", "exp"]) {
+    if (Object.hasOwn(claims, reserved)) {
+      throw new Error(
+        `The '${reserved}' claim is set by Convex and can't be provided`,
+      );
+    }
+  }
+  const reservedPrefixClaim = Object.keys(claims).find((name) =>
+    RESERVED_JWT_CLAIM_PREFIXES.some(
+      (prefix) =>
+        name.slice(0, prefix.length).toLowerCase() === prefix.toLowerCase(),
+    ),
+  );
+  if (reservedPrefixClaim !== undefined) {
+    throw new Error(
+      `The '${reservedPrefixClaim}' claim can't be provided: claim names ` +
+        `starting with 'convex' or 'cvx' are reserved`,
+    );
+  }
+  if (
+    Object.hasOwn(claims, "sub") &&
+    (typeof claims.sub !== "string" || claims.sub === "")
+  ) {
+    throw new Error("The 'sub' claim must be a non-empty string");
+  }
+  if (Object.hasOwn(claims, "nbf")) {
+    throw new Error(
+      "The 'nbf' claim is reserved by Convex and can't be provided",
+    );
+  }
+  // The backend truncates the lifetime to whole seconds.
+  const expiresIn = Math.floor(expiresInSeconds);
+  if (expiresIn > DEPLOYMENT_JWT_MAX_LIFETIME_SECONDS) {
+    throw new Error(
+      `expiresIn must be between 1 second and ${DEPLOYMENT_JWT_MAX_LIFETIME_SECONDS} seconds`,
+    );
+  }
+
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const payload = {
+    ...claims,
+    iss: deploymentJwtIssuer(getCurrentComponentPath()),
+    iat: issuedAt,
+    exp: issuedAt + expiresIn,
+  };
+  const { privateKey, kid } = await getDeploymentJwtKey();
+  const header = { alg: "ES256", typ: "JWT", kid };
+  const signingInput =
+    base64UrlEncode(JSON.stringify(header)) +
+    "." +
+    base64UrlEncode(JSON.stringify(payload));
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    privateKey,
+    new TextEncoder().encode(signingInput),
+  );
+  const token = `${signingInput}.${base64UrlEncodeBytes(new Uint8Array(signature))}`;
+  if (token.length > DEPLOYMENT_JWT_MAX_SIZE) {
+    throw new Error(
+      `The token is ${token.length} bytes, over the ${DEPLOYMENT_JWT_MAX_SIZE} byte limit`,
+    );
+  }
+  return token;
+}
+
+// The app signs under the deployment's origin and a component under
+// `{origin}/components/{path}`.
+function deploymentJwtIssuer(componentPath: string) {
+  const origin = (
+    (typeof process !== "undefined" && process.env.CONVEX_CLOUD_URL) ||
+    DEFAULT_CONVEX_CLOUD_URL
+  ).replace(/\/+$/, "");
+  return componentPath === ROOT_COMPONENT_PATH
+    ? origin
+    : `${origin}/components/${componentPath}`;
+}
+
+function getDeploymentJwtKey() {
+  const convex = getConvexGlobal();
+  convex.deploymentJwtKey ??= generateDeploymentJwtKey();
+  return convex.deploymentJwtKey;
+}
+
+async function generateDeploymentJwtKey(): Promise<DeploymentJwtKey> {
+  const { privateKey, publicKey } = await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    false,
+    ["sign", "verify"],
+  );
+  const { x, y } = await crypto.subtle.exportKey("jwk", publicKey);
+  // Like the backend, use the key's RFC 7638 thumbprint as its `kid`.
+  const thumbprint = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(
+      JSON.stringify({ crv: "P-256", kty: "EC", x: x!, y: y! }),
+    ),
+  );
+  const kid = base64UrlEncodeBytes(new Uint8Array(thumbprint));
+  return {
+    privateKey,
+    kid,
+    publicJwk: {
+      kty: "EC",
+      crv: "P-256",
+      x: x!,
+      y: y!,
+      kid,
+      alg: "ES256",
+      use: "sig",
+    },
+  };
+}
+
+// What the backend serves at `${CONVEX_CLOUD_URL}/.well-known/jwks.json`.
+async function deploymentJwks(): Promise<DeploymentJwks> {
+  const { publicJwk } = await getDeploymentJwtKey();
+  return { keys: [{ ...publicJwk }] };
 }
 
 // Runs a function that was scheduled, moving its `_scheduled_functions`
@@ -1616,18 +1872,13 @@ function asyncSyscallImpl() {
           maximumRowsRead,
           maximumBytesRead,
         } = args;
-        // Convex only allows a single paginated query (`.paginate()`) per
-        // function execution. Multiple `.paginate()` calls pass in the test
-        // mock but fail at runtime in a deployed function, so always enforce
-        // the rule.
-        const ctx = executionContextStorage.getStore();
-        if (ctx) {
-          ctx.paginatedQueries += 1;
-          if (ctx.paginatedQueries > 1) {
+        const pagination = executionContextStorage.getStore()?.pagination;
+        if (pagination) {
+          pagination.calls += 1;
+          if (pagination.calls > 1) {
             throw new Error(
               "Only a single paginated query (`.paginate()`) is allowed per " +
-                "function execution. Calling `.paginate()` more than once in a " +
-                "single Convex function fails at runtime in a deployed backend. " +
+                "query, including nested query calls and component calls. " +
                 "This is a Convex limit: https://docs.convex.dev/database/pagination",
             );
           }
@@ -1819,6 +2070,8 @@ function asyncSyscallImpl() {
           reference,
           functionHandle,
         });
+        // Load the component eagerly so a missing registration fails here.
+        getComponentInfo(functionPath.componentPath);
         const handle = createFunctionHandle(functionPath);
         return JSON.stringify(handle);
       }
@@ -1838,6 +2091,8 @@ function asyncSyscallImpl() {
         } = args;
         const functionAddress = { name, reference, functionHandle };
         const functionPath = getFunctionPathFromAddress(functionAddress);
+        // Load the component eagerly so a missing registration fails here.
+        getComponentInfo(functionPath.componentPath);
         // Convert args to a Convex value before storing them or passing them to the function
         const parsedArgs = jsonToConvex(fnArgs);
         // Scheduled arguments cannot contain pending values
@@ -1886,7 +2141,9 @@ function asyncSyscallImpl() {
                 });
               scheduler.add(promise);
             },
-            Math.max(0, tsInSecs * 1000 - Date.now()),
+            // Like the backend's scheduler, measure the due time against the
+            // wall clock, not the scheduling transaction's pinned time.
+            Math.max(0, tsInSecs * 1000 - frameworkNow()),
           );
         });
         return JSON.stringify(convexToJson(jobId));
@@ -1918,6 +2175,10 @@ function asyncSyscallImpl() {
       }
       case "1.0/storageDelete": {
         const { storageId } = args;
+        const metadata = db.get("_storage", storageId);
+        if (metadata !== null && db.isPendingFile(storageId)) {
+          tracker?.untrackFileWrite(metadata.size as number);
+        }
         await writeToDatabase(async (db) => {
           db.delete("_storage", storageId);
         });
@@ -1935,6 +2196,47 @@ function asyncSyscallImpl() {
           "https://some-deployment.convex.cloud/api/storage/" +
           (sha256 as string);
         return JSON.stringify(convexToJson(url));
+      }
+      case "1.0/storageStore": {
+        const { blob, contentType, sha256: expectedSha256 } = args;
+        const bytes = Base64.toByteArray(blob) as Uint8Array<ArrayBuffer>;
+        const type = contentType || undefined;
+        const file = new Blob([bytes], { type });
+        const sha256 = await blobSha(file);
+        if (expectedSha256 != null && expectedSha256 !== sha256) {
+          throw new Error(
+            `Sha256 mismatch. Expected: ${expectedSha256} Actual: ${sha256}`,
+          );
+        }
+        tracker?.trackFileWrite(bytes.length);
+        const storageId = await writeToDatabase(async (db) => {
+          const storageId = db.insert("_storage", {
+            size: bytes.length,
+            sha256,
+            ...(type !== undefined ? { contentType: type } : {}),
+          });
+          db.storeFile(storageId, file);
+          return storageId;
+        });
+        return JSON.stringify(convexToJson(storageId));
+      }
+      case "1.0/storageGet": {
+        const { storageId } = args;
+        const file = db.getFile(storageId);
+        if (file == null) {
+          return JSON.stringify(null);
+        }
+        const metadata = db.get("_storage", storageId)!;
+        const fileKey = `${db.componentPath}:${storageId}`;
+        const filesRead = getTransactionManager().getFilesRead();
+        if (!db.isPendingFile(storageId) && !filesRead.has(fileKey)) {
+          tracker?.trackFileRead(metadata.size as number);
+          filesRead.add(fileKey);
+        }
+        return JSON.stringify({
+          blob: Base64.fromByteArray(new Uint8Array(await file.arrayBuffer())),
+          contentType: metadata.contentType ?? null,
+        });
       }
       case "1.0/storageGenerateUploadUrl": {
         // In the real backend the token is cryptographically secure
@@ -1978,14 +2280,15 @@ function jsSyscallImpl() {
     switch (op) {
       case "storage/storeBlob": {
         const { blob } = args as { blob: Blob };
-        const storageId = await writeToDatabase(async (db) => {
-          return db.insert("_storage", {
+        return await writeToDatabase(async (db) => {
+          const storageId = db.insert("_storage", {
             size: blob.size,
             sha256: await blobSha(blob),
+            ...(blob.type ? { contentType: blob.type } : {}),
           });
+          db.storeFile(storageId, blob);
+          return storageId;
         });
-        db.storeFile(storageId, blob);
-        return storageId;
       }
       case "storage/getBlob": {
         const { storageId } = args as { storageId: GenericId<"_storage"> };
@@ -2019,6 +2322,206 @@ async function blobSha(blob: Blob) {
 
 export type TestConvex<SchemaDef extends SchemaDefinition<any, boolean>> =
   TestConvexRoot<DataModelFromSchemaDefinition<SchemaDef>>;
+
+/**
+ * A component registration function that can return its generated `ComponentApi`.
+ *
+ * Returning typed component references lets `defineTestApp` infer the component
+ * API. If the component doesn't export a `register` function from their /test
+ * entrypoint that returns the ComponentApi, it can be cast like
+ * `{ register: componentTest.register as ComponentRegistration<ComponentApi> }`.
+ *
+ * Note: `defineTestApp` does not use the returned value.
+ */
+export type ComponentRegistration<Api> = (
+  t: TestConvexRoot<any>,
+  name: string,
+) => Api | void;
+
+// Match generated ComponentApi<Name> references for each named installation.
+type ComponentApiForName<Api, Name extends string> =
+  Api extends FunctionReference<
+    infer Type,
+    infer Visibility,
+    infer Args,
+    infer ReturnType
+  >
+    ? FunctionReference<Type, Visibility, Args, ReturnType, Name>
+    : { [Key in keyof Api]: ComponentApiForName<Api[Key], Name> };
+
+type ComponentRegistrations = Record<
+  string,
+  { register: ComponentRegistration<any> }
+>;
+
+type RegisteredComponents<Components extends ComponentRegistrations> = {
+  [Name in keyof Components]: Components[Name]["register"] extends ComponentRegistration<
+    infer Api
+  >
+    ? ComponentApiForName<Api, Name & string>
+    : never;
+};
+
+/** Schema-bound function builders for an in-memory test application. */
+export type TestApp<
+  SchemaDef extends SchemaDefinition<any, boolean>,
+  Components extends ComponentRegistrations = Record<never, never>,
+> = {
+  /** Typed references to the configured component instances. */
+  components: RegisteredComponents<Components>;
+  query: QueryBuilder<DataModelFromSchemaDefinition<SchemaDef>, "public">;
+  internalQuery: QueryBuilder<
+    DataModelFromSchemaDefinition<SchemaDef>,
+    "internal"
+  >;
+  mutation: MutationBuilder<DataModelFromSchemaDefinition<SchemaDef>, "public">;
+  internalMutation: MutationBuilder<
+    DataModelFromSchemaDefinition<SchemaDef>,
+    "internal"
+  >;
+  action: ActionBuilder<DataModelFromSchemaDefinition<SchemaDef>, "public">;
+  internalAction: ActionBuilder<
+    DataModelFromSchemaDefinition<SchemaDef>,
+    "internal"
+  >;
+  /**
+   * Define function modules by their paths, e.g. `test` or `test/callbacks`,
+   * without a leading `./` or file extension. Values are module exports,
+   * rather than the import functions returned by `import.meta.glob`.
+   *
+   * References have the same types and behavior as generated Convex APIs.
+   * Public functions appear in `api` and internal functions in `internal`.
+   * Handlers referencing this API may need explicit return type annotations
+   * to break TypeScript inference cycles.
+   */
+  defineModules<Modules extends Record<string, object>>(
+    this: void,
+    modules: Modules,
+  ): TestAppDefinition<SchemaDef, Modules>;
+};
+
+/** Typed function references and a factory for fresh test instances. */
+export type TestAppDefinition<
+  SchemaDef extends SchemaDefinition<any, boolean>,
+  Modules extends Record<string, object>,
+> = {
+  api: FilterApi<ApiFromModules<Modules>, FunctionReference<any, "public">>;
+  internal: FilterApi<
+    ApiFromModules<Modules>,
+    FunctionReference<any, "internal">
+  >;
+  /**
+   * Create fresh test state and register the configured components. Additional
+   * components can be registered using their helpers or `t.registerComponent`.
+   * `transactionLimits` has the same meaning as in `convexTest`.
+   */
+  createTest(
+    this: void,
+    options?: { transactionLimits?: Partial<TransactionMetrics> | boolean },
+  ): TestConvex<SchemaDef>;
+};
+
+/**
+ * Define an in-memory test application without generated files.
+ *
+ * The returned function builders are typed against `schema`. Pass modules of
+ * registered functions to `defineModules` to get typed `api` and `internal`
+ * references and a `createTest` factory. Each call to `createTest` creates fresh
+ * test state and returns a normal {@link TestConvex}, which can be passed to
+ * component testing helpers such as `componentTest.register(t)`.
+ *
+ * Optional `components` map keys are instance names. Each helper's `register`
+ * function runs on every `createTest()` call. Helpers returning `ComponentApi`
+ * provide typed references in `app.components`. Helpers returning `void` can be
+ * cast to {@link ComponentRegistration} to supply their API type.
+ *
+ * @example
+ * const app = defineTestApp({
+ *   schema,
+ *   components: { sampleComponent: sampleComponentTest },
+ * });
+ * const { api, createTest } = app.defineModules({
+ *   test: {
+ *     bar: app.mutation({
+ *       args: { text: v.string() },
+ *       returns: v.id("messages"),
+ *       handler: async (ctx, args) => ctx.db.insert("messages", args),
+ *     }),
+ *   },
+ * });
+ * const t = createTest();
+ * await t.mutation(api.test.bar, { text: "hello" });
+ * await t.query(app.components.sampleComponent.public.count, { name: "beans" });
+ */
+export function defineTestApp<
+  SchemaDef extends SchemaDefinition<any, boolean>,
+  Components extends ComponentRegistrations = Record<never, never>,
+>({
+  schema,
+  components,
+}: {
+  schema: SchemaDef;
+  components?: Components;
+}): TestApp<SchemaDef, Components> {
+  const registrations = Object.entries(components ?? {});
+  for (const [name] of registrations) {
+    if (name.length === 0 || name.includes("/") || name.includes(" ")) {
+      throw new Error(
+        `Invalid component instance name "${name}": expected a nonempty name without slashes or spaces. Register nested components inside the parent's "register" function.`,
+      );
+    }
+  }
+  return {
+    components: componentsGeneric() as RegisteredComponents<Components>,
+    query: queryGeneric,
+    internalQuery: internalQueryGeneric,
+    mutation: mutationGeneric,
+    internalMutation: internalMutationGeneric,
+    action: actionGeneric,
+    internalAction: internalActionGeneric,
+
+    defineModules<Modules extends Record<string, object>>(modules: Modules) {
+      const moduleMap = new Map(Object.entries(modules));
+      const loadModule = async (path: string) => {
+        const module = moduleMap.get(path);
+        if (module === undefined) {
+          throw new Error(`Could not find module for: "${path}"`);
+        }
+        return module;
+      };
+      const fullApi = anyApi as unknown as ApiFromModules<Modules>;
+      return {
+        api: filterApi<typeof fullApi, FunctionReference<any, "public">>(
+          fullApi,
+        ),
+        internal: filterApi<typeof fullApi, FunctionReference<any, "internal">>(
+          fullApi,
+        ),
+        createTest(
+          options: {
+            transactionLimits?: Partial<TransactionMetrics> | boolean;
+          } = {},
+        ): TestConvex<SchemaDef> {
+          const t = createConvexTest(
+            schema,
+            loadModule,
+            options.transactionLimits ?? false,
+          );
+          for (const [name, registration] of registrations) {
+            const result = registration.register(t, name);
+            if (typeof result?.then === "function") {
+              throw new Error(
+                `Component registration for "${name}" returned a Promise. ` +
+                  `The "register" function must be synchronous.`,
+              );
+            }
+          }
+          return t;
+        },
+      };
+    },
+  };
+}
 
 export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   /**
@@ -2201,6 +2704,39 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   withRequestMetadata(
     metadata: Partial<Pick<RequestMetadata, "ip" | "userAgent">>,
   ): TestConvexForDataModel<DataModel>;
+
+  /**
+   * The public keys that verify tokens signed by `ctx.auth.signJwt`, like the
+   * JWKS the backend serves at `${CONVEX_CLOUD_URL}/.well-known/jwks.json`.
+   *
+   * Each `convexTest` instance signs with its own key, so the JWKS only
+   * verifies tokens signed by the same instance.
+   *
+   * ```ts
+   * import { createLocalJWKSet, jwtVerify } from "jose";
+   *
+   * const { payload } = await jwtVerify(token, createLocalJWKSet(await t.jwks()));
+   * ```
+   */
+  jwks(): Promise<DeploymentJwks>;
+};
+
+/**
+ * A JSON Web Key Set, as returned by {@link TestConvexForDataModel.jwks}.
+ */
+export type DeploymentJwks = { keys: DeploymentJwk[] };
+
+/**
+ * A public key that verifies tokens signed by `ctx.auth.signJwt`.
+ */
+export type DeploymentJwk = {
+  kty: "EC";
+  crv: "P-256";
+  x: string;
+  y: string;
+  kid: string;
+  alg: "ES256";
+  use: "sig";
 };
 
 /**
@@ -2211,12 +2747,14 @@ export type TestConvexRoot<DataModel extends GenericDataModel> = {
   /**
    * Register a component, so that the functions of the app under test can call
    * it.
+   *
+   * @returns References to the component's functions, typed as `ComponentApi`.
    */
-  registerComponent: (
+  registerComponent: <ComponentApi = unknown>(
     componentPath: string,
     schema: SchemaDefinition<GenericSchema, boolean>,
     glob: Record<string, () => Promise<any>>,
-  ) => void;
+  ) => ComponentApi;
 } & TestConvexForDataModel<DataModel>;
 
 /**
@@ -2229,11 +2767,28 @@ export type TestConvexForDataModelAndIdentity<
 function getComponentInfo(componentPath: string): ComponentInfo {
   const convex = getConvexGlobal();
   if (convex.components[componentPath] === undefined) {
-    throw new Error(
-      `Component "${componentPath}" is not registered. Call "t.registerComponent".`,
-    );
+    throw new Error(formatUnregisteredComponentError(componentPath));
   }
   return convex.components[componentPath];
+}
+
+function formatUnregisteredComponentError(componentPath: string): string {
+  const convex = getConvexGlobal();
+  const registered = Object.keys(convex.components).filter(
+    (p) => p !== ROOT_COMPONENT_PATH,
+  );
+  const registeredHint =
+    registered.length === 0
+      ? "No components have been registered on this `convexTest` instance."
+      : `Registered components: ${registered.map((p) => `"${p}"`).join(", ")}.`;
+  return (
+    `Component "${componentPath}" is not registered on this \`convexTest\` instance. ` +
+    `If it is a published component, import its test helper and call it on \`t\` ` +
+    `(e.g. \`import { register } from "<component>/test"; register(t);\`). ` +
+    `Otherwise call \`t.registerComponent("${componentPath}", componentSchema, componentModules)\` directly ` +
+    `(see https://docs.convex.dev/components/using#testing-components). ` +
+    registeredHint
+  );
 }
 
 function getDbForComponent(componentPath: string) {
@@ -2329,9 +2884,9 @@ type ExecutionContext = {
   udfPath: string;
   udfType: UdfType;
   depth: number; // 0 = top-level, 1+ = nested
-  // Number of paginated queries (`.paginate()`) executed so far in this
-  // function execution. Convex only allows one per function invocation.
-  paginatedQueries: number;
+  // Queries share this counter with their nested queries, including components.
+  // Mutations have no counter; each query they call gets a fresh one.
+  pagination?: { calls: number };
 };
 
 const executionContextStorage = new AsyncLocalStorage<ExecutionContext>();
@@ -2372,6 +2927,14 @@ type ConvexGlobal = {
   syscall: (op: string, args: any) => any;
   asyncSyscall: (op: string, args: any) => Promise<any>;
   jsSyscall: (op: string, args: any) => Promise<any>;
+  // Generated on the first `ctx.auth.signJwt` call.
+  deploymentJwtKey: Promise<DeploymentJwtKey> | null;
+};
+
+type DeploymentJwtKey = {
+  privateKey: CryptoKey;
+  kid: string;
+  publicJwk: DeploymentJwk;
 };
 
 function getConvexGlobal(): ConvexGlobal {
@@ -2442,6 +3005,12 @@ const PATCHABLE_GLOBALS = [
 type GlobalOverrides = Record<string, unknown>;
 const globalOverridesStorage = new AsyncLocalStorage<GlobalOverrides>();
 
+// Framework clocks honor test setup (including fake timers), but not a
+// handler's pinned Date or its own replacement of that global.
+function frameworkNow(): number {
+  return globalOverridesStorage.exit(() => Date.now());
+}
+
 // The framework's own scheduler needs setTimeout even when running inside a
 // transaction context where setTimeout is disallowed for user code. Exit the
 // override store before reading globalThis.setTimeout so we get the underlying
@@ -2472,7 +3041,27 @@ function disallowedInTransaction(name: string): (...args: unknown[]) => never {
 }
 
 function transactionGlobalOverrides(): GlobalOverrides {
+  const BaseDate = globalOverridesStorage.exit(() => Date);
+  const time = getTransactionManager().getTime();
+  const now = () => time;
   return {
+    Date: new Proxy(BaseDate, {
+      get(target, property, receiver) {
+        return property === "now"
+          ? now
+          : Reflect.get(target, property, receiver);
+      },
+      construct(target, args, newTarget) {
+        return Reflect.construct(
+          target,
+          args.length === 0 ? [time] : args,
+          newTarget,
+        );
+      },
+      apply() {
+        return new BaseDate(time).toString();
+      },
+    }),
     fetch: disallowedInTransaction("fetch"),
     setTimeout: disallowedInTransaction("setTimeout"),
     clearTimeout: disallowedInTransaction("clearTimeout"),
@@ -2556,6 +3145,13 @@ function installGlobalProxies() {
   }
 }
 
+/**
+ * We use this wrapper every time we run user-provided code. Even though we
+ * already install global proxies when `convexTest()` is first called, they can
+ * be removed by changes we can't intercept (`delete`, `Object.defineProperty`,
+ * `vi.stubGlobal`…). Re-installing them before every handler repairs isolation
+ * after such changes.
+ */
 function runWithGlobalOverrides<T>(
   overrides: GlobalOverrides,
   handler: () => T,
@@ -2646,6 +3242,12 @@ class TransactionManager {
   // The latest committed transaction's timestamp, in Unix nanoseconds.
   // Zero represents the initial empty database, before any commits.
   private _lastCommitTs: bigint = 0n;
+  // Milliseconds pinned at top-level transaction start, shared by nested calls.
+  private _udfTime: number | null = null;
+  // Files already read by the current top-level transaction, including by
+  // nested calls that rolled back. Reading one again doesn't count toward the
+  // read limits.
+  private _filesRead: Set<string> | null = null;
 
   constructor(limitsConfig: Partial<TransactionMetrics> | boolean = false) {
     this._limitsConfig = limitsConfig;
@@ -2666,10 +3268,17 @@ class TransactionManager {
       while (this._waitOnCurrentFunction !== null) {
         await this._waitOnCurrentFunction;
       }
+      // Round up in bigint arithmetic so a one-nanosecond commit clock tick
+      // cannot disappear when converted to milliseconds.
+      this._udfTime = Math.max(
+        frameworkNow(),
+        Number((this._lastCommitTs + 999_999n) / 1_000_000n),
+      );
       this._waitOnCurrentFunction = new Promise((resolve) => {
         this._markTransactionDone = resolve;
       });
       this._metricsTracker = new TransactionMetricsTracker(this._limitsConfig);
+      this._filesRead = new Set();
     }
     const convex = getConvexGlobal();
     for (const component of Object.values(convex.components)) {
@@ -2702,6 +3311,20 @@ class TransactionManager {
     return this._metricsTracker;
   }
 
+  getFilesRead(): Set<string> {
+    if (this._filesRead === null) {
+      throw new Error("Transaction not started");
+    }
+    return this._filesRead;
+  }
+
+  getTime(): number {
+    if (this._udfTime === null) {
+      throw new Error("Transaction not started");
+    }
+    return this._udfTime;
+  }
+
   getSnapshotTs(): bigint {
     if (!this.isInTransaction()) {
       throw new Error(
@@ -2718,7 +3341,7 @@ class TransactionManager {
   commit(isNested: boolean): bigint | null {
     let commitTs: bigint | null = null;
     if (!isNested) {
-      const nowNanos = BigInt(Date.now()) * 1_000_000n;
+      const nowNanos = BigInt(frameworkNow()) * 1_000_000n;
       // Assign a new timestamp only when committing the outermost transaction.
       // Bump by one if the clock is frozen or has moved backwards.
       commitTs =
@@ -2748,7 +3371,9 @@ class TransactionManager {
       throw new Error("Transaction not started");
     }
     if (!isNested) {
+      this._udfTime = null;
       this._metricsTracker = null;
+      this._filesRead = null;
       this._waitOnCurrentFunction = null;
       this._markTransactionDone();
       this._markTransactionDone = null;
@@ -2807,9 +3432,9 @@ export function convexTest<Schema extends GenericSchema>(
  *     - `true` or `{}`: enforce default Convex limits
  *     - `{ bytesRead: 1024 }`: override specific limits
  *
- * Regardless of `transactionLimits`, a single function execution may only run
- * one paginated query (`.paginate()`); calling it more than once throws,
- * matching the behavior of a deployed Convex backend.
+ * Regardless of `transactionLimits`, a query may only call `.paginate()` once,
+ * including nested query calls and component calls. Mutations may paginate
+ * multiple times and call multiple queries that each paginate once.
  *
  * @returns an object which is by convention stored in the `t` variable
  *   and which provides methods for exercising your Convex functions.
@@ -2862,12 +3487,20 @@ export function convexTest<Schema extends GenericSchema>(
     limitsConfig = opts.transactionLimits ?? false;
   }
 
+  return createConvexTest(schema, moduleCache(modules), limitsConfig);
+}
+
+function createConvexTest<SchemaDef extends SchemaDefinition<any, boolean>>(
+  schema: SchemaDef | undefined,
+  modules: ComponentInfo["modules"],
+  limitsConfig: Partial<TransactionMetrics> | boolean,
+): TestConvex<SchemaDef> {
   const rootDb = new DatabaseFake(schema ?? null, ROOT_COMPONENT_PATH);
   const convexGlobal: ConvexGlobal = {
     components: {
       [ROOT_COMPONENT_PATH]: {
         db: rootDb,
-        modules: moduleCache(modules),
+        modules,
       },
     },
     transactionManager: new TransactionManager(limitsConfig),
@@ -2875,6 +3508,7 @@ export function convexTest<Schema extends GenericSchema>(
     syscall: syscallImpl(),
     asyncSyscall: asyncSyscallImpl(),
     jsSyscall: jsSyscallImpl(),
+    deploymentJwtKey: null,
   };
   ensureGlobalProxy();
 
@@ -2892,7 +3526,7 @@ export function convexTest<Schema extends GenericSchema>(
     return result;
   }
 
-  function registerComponent(
+  function registerComponent<ComponentApi = unknown>(
     componentPath: string,
     schema: SchemaDefinition<GenericSchema, boolean>,
     glob: Record<string, () => Promise<any>>,
@@ -2902,6 +3536,7 @@ export function convexTest<Schema extends GenericSchema>(
       modules: moduleCache(glob),
     };
     convexGlobal.components[componentPath] = componentInfo;
+    return componentsGeneric()[componentPath] as unknown as ComponentApi;
   }
 
   // Each accessor is immutable: `withIdentity` and `withRequestMetadata`
@@ -2910,6 +3545,7 @@ export function convexTest<Schema extends GenericSchema>(
   function testAccessor(auth: AuthFake, requestOptions: RequestOptions): any {
     return {
       ...wrapInContext(withAuth(auth, requestOptions)),
+      jwks: () => convexGlobalStorage.run(convexGlobal, deploymentJwks),
       withIdentity(identity: Partial<UserIdentity>) {
         const subject =
           identity.subject ?? "" + simpleHash(JSON.stringify(identity));
@@ -2939,24 +3575,9 @@ export function convexTest<Schema extends GenericSchema>(
   };
 }
 
-// Yield through a full event loop iteration so that dynamic import()
-// calls (used to load function modules) can resolve. Using MessageChannel
-// to post to the macrotask queue — it is not faked by vitest and not
-// removed by edge-runtime.
-function yieldToEventLoop(): Promise<void> {
-  return new Promise<void>((r) => {
-    const { port1, port2 } = new MessageChannel();
-    port2.onmessage = () => r();
-    port1.postMessage(null);
-  });
-}
-
-// The real setTimeout, captured before any test can install fake timers.
-// MessagePort messages can be delivered without passing through the event
-// loop's timers phase, so `yieldToEventLoop` does not guarantee that
-// expired real timers fire. Awaiting a real 0ms timeout does: all timers
-// that expired earlier fire first.
+// Capture before fake timers are installed.
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
 
 function yieldThroughRealTimers(): Promise<void> {
   return new Promise<void>((r) => realSetTimeout(r, 0));
@@ -3000,7 +3621,7 @@ function withAuth(
       handler: (ctx: any, a: any) => {
         const testCtx = {
           ...ctx,
-          auth: authStorage.getStore() ?? auth,
+          auth: mutationAuth(authStorage.getStore() ?? auth),
           ...extraCtx,
         };
         return runWithGlobalOverrides(transactionGlobalOverrides(), () =>
@@ -3018,7 +3639,6 @@ function withAuth(
       udfPath: functionPath.udfPath,
       udfType: "mutation",
       depth: (parentCtx?.depth ?? 0) + 1,
-      paginatedQueries: 0,
     };
     const requestMetadata = requestMetadataForExecution();
 
@@ -3084,7 +3704,7 @@ function withAuth(
       udfPath: functionPath.udfPath,
       udfType: "query",
       depth: (parentCtx?.depth ?? 0) + 1,
-      paginatedQueries: 0,
+      pagination: (isNested && parentCtx?.pagination) || { calls: 0 },
     };
     const requestMetadata = requestMetadataForExecution();
 
@@ -3152,7 +3772,6 @@ function withAuth(
       udfPath: functionPath.udfPath,
       udfType: "action",
       depth: (parentCtx?.depth ?? 0) + 1,
-      paginatedQueries: 0,
     };
     const requestMetadata = requestMetadataForExecution();
     return await executionContextStorage.run(childCtx, async () => {
@@ -3502,7 +4121,6 @@ function withAuth(
         udfPath: "http",
         udfType: "http",
         depth: 0,
-        paginatedQueries: 0,
       };
       // The request's headers are not inspected: like the identity, the IP and
       // the user agent are configured on the test accessor.
@@ -3530,6 +4148,21 @@ function withAuth(
       // each function.
       // Stop after a fixed number of iterations to avoid infinite loops.
       const { scheduler } = getConvexGlobal();
+      const originalSetTimeout = globalOverridesStorage.exit(
+        () => globalThis.setTimeout,
+      );
+      const advanceTimersIfActive = () => {
+        const currentSetTimeout = globalOverridesStorage.exit(
+          () => globalThis.setTimeout,
+        );
+        if (currentSetTimeout !== originalSetTimeout) {
+          throw new Error(
+            "finishAllScheduledFunctions: timers were restored or replaced " +
+              "while waiting for scheduled functions.",
+          );
+        }
+        advanceTimers();
+      };
       // A function scheduled while real timers were active sits on a real
       // setTimeout that advanceTimers (fake timers) cannot fire. If it has
       // already expired it fires within a few real event loop turns, so
@@ -3541,7 +4174,7 @@ function withAuth(
       const maxIdleTurns = 20;
       let idleTurns = 0;
       for (let i = 0; i < maxIterations; i++) {
-        advanceTimers();
+        advanceTimersIfActive();
         if (!scheduler.anyFunctionsRunning()) {
           if (!scheduler.anyPendingTimers() || idleTurns >= maxIdleTurns) {
             return;
@@ -3551,23 +4184,28 @@ function withAuth(
           continue;
         }
         idleTurns = 0;
-        // Actions may use setTimeout internally (e.g. for delays).
-        // Keep advancing timers while waiting so those can resolve.
-        let done = false;
-        void scheduler.finishInProgressScheduledFunctions().then(() => {
-          done = true;
-        });
-        const maxPumps = 10000;
-        for (let pump = 0; pump < maxPumps && !done; pump++) {
-          advanceTimers();
-          await yieldToEventLoop();
-          if (pump === maxPumps - 1 && !done) {
-            throw new Error(
-              "finishAllScheduledFunctions: scheduled function did not " +
-                `complete after ${maxPumps} timer pumps. ` +
-                "Does an action have an unresolvable setTimeout or infinite loop?",
-            );
-          }
+        // Advance timers while waiting for scheduled functions to finish.
+        // Stop if teardown restores or replaces the clock.
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const pump = () => {
+              try {
+                advanceTimersIfActive();
+                timer = realSetTimeout(pump, 0);
+              } catch (error) {
+                // Preserve the value thrown by advanceTimers.
+                // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
+                reject(error);
+              }
+            };
+            void scheduler
+              .finishInProgressScheduledFunctions()
+              .then(resolve, reject);
+            pump();
+          });
+        } finally {
+          realClearTimeout(timer);
         }
       }
       throw new Error(

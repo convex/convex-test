@@ -1,6 +1,6 @@
 {
   "name": "convex-test",
-  "version": "0.0.59",
+  "version": "0.0.67",
   "description": "A JS mock of the Convex backend for testing your Convex functions.",
   "keywords": [
     "test",
@@ -9,8 +9,8 @@
     "convex"
   ],
   "homepage": "https://docs.convex.dev/functions/testing",
-  "bugs": "https://github.com/get-convex/convex-test/issues",
-  "repository": "https://github.com/get-convex/convex-test",
+  "bugs": "https://github.com/convex/convex-test/issues",
+  "repository": "https://github.com/convex/convex-test",
   "main": "dist/index.js",
   "type": "module",
   "files": [
@@ -48,7 +48,7 @@
     "@typescript-eslint/eslint-plugin": "8.58.2",
     "@typescript-eslint/parser": "8.58.2",
     "@vitest/coverage-v8": "1.6.1",
-    "convex": "1.43.0",
+    "convex": "1.48.0",
     "eslint": "9.39.4",
     "globals": "17.5.0",
     "jose": "^6.2.12",

@@ -1,4 +1,5 @@
 import { v } from "convex/values";
+import { paginationOptsValidator } from "convex/server";
 import { action, mutation, query } from "./_generated/server";
 import { api } from "./_generated/api";
 import { getSnapshotTs } from "../../getSnapshotTs";
@@ -159,5 +160,12 @@ export const getCommitTs = query({
       .withIndex("name", (q) => q.eq("name", args.name).eq("shard", 0))
       .unique();
     return doc!.commitTs ?? null;
+  },
+});
+
+export const paginate = query({
+  args: { paginationOpts: paginationOptsValidator },
+  handler: async (ctx, args) => {
+    return await ctx.db.query("counters").paginate(args.paginationOpts);
   },
 });

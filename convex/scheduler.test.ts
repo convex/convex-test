@@ -3,6 +3,30 @@ import { convexTest } from "../index";
 import { api, internal } from "./_generated/api";
 import schema from "./schema";
 
+const modules = import.meta.glob("./**/*.*s");
+const realSetTimeout = globalThis.setTimeout;
+
+async function blockedScheduledFunction() {
+  let notifyLoading!: () => void;
+  const loading = new Promise<void>((resolve) => {
+    notifyLoading = resolve;
+  });
+  const t = convexTest(schema, {
+    ...modules,
+    "./scheduler.ts": () => {
+      notifyLoading();
+      return new Promise<never>(() => {});
+    },
+  });
+  await t.mutation(async (ctx) => {
+    await ctx.scheduler.runAfter(0, api.scheduler.add, {
+      body: "blocked module load",
+      author: "AI",
+    });
+  });
+  return { t, loading };
+}
+
 describe("with fake timers", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -182,6 +206,47 @@ describe("with fake timers", () => {
     await t.finishAllScheduledFunctions(vi.runAllTimers);
     const result = await t.query(internal.scheduler.list);
     expect(result).toMatchObject([{ body: "delayed action", author: "AI" }]);
+  });
+
+  test("stops advancing timers when the original fake clock is replaced", async () => {
+    const { t, loading } = await blockedScheduledFunction();
+    const outcome = t
+      .finishAllScheduledFunctions(vi.runAllTimers)
+      .catch((error) => error);
+    await loading;
+
+    // A timed-out test restores its timers, then the next test installs a new clock.
+    vi.useRealTimers();
+    vi.useFakeTimers();
+    const nextTestTimer = vi.fn();
+    setTimeout(nextTestTimer, 60_000);
+
+    await new Promise<void>((resolve) => realSetTimeout(resolve, 20));
+
+    expect(nextTestTimer).not.toHaveBeenCalled();
+    expect(await outcome).toMatchObject({
+      message: expect.stringContaining("timers were restored or replaced"),
+    });
+  });
+
+  test("stops pumping when advanceTimers throws", async () => {
+    const { t, loading } = await blockedScheduledFunction();
+    const reason = new Error("cannot advance timers");
+    const advanceTimers = vi.fn(vi.runAllTimers);
+    const outcome = t
+      .finishAllScheduledFunctions(advanceTimers)
+      .catch((error) => error);
+    await loading;
+    advanceTimers.mockImplementation(() => {
+      throw reason;
+    });
+
+    expect(await outcome).toBe(reason);
+    advanceTimers.mockClear();
+
+    await new Promise<void>((resolve) => realSetTimeout(resolve, 20));
+
+    expect(advanceTimers).not.toHaveBeenCalled();
   });
 
   test("new convexTest after orphaned scheduled functions", async () => {

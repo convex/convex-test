@@ -1,8 +1,25 @@
 import { paginationOptsValidator } from "convex/server";
 import { v } from "convex/values";
-import { query } from "./_generated/server";
+import { internalQuery, query } from "./_generated/server";
+import { api } from "./_generated/api";
 
 /// paginate (1.0/queryPage)
+
+export const paginateTwice = internalQuery({
+  args: { nested: v.boolean() },
+  returns: v.null(),
+  handler: async (ctx, { nested }) => {
+    for (let i = 0; i < 2; i++) {
+      const paginationOptions = { cursor: null, numItems: 10 };
+      if (nested) {
+        await ctx.runQuery(api.pagination.listAll, { paginationOptions });
+      } else {
+        await ctx.db.query("messages").paginate(paginationOptions);
+      }
+    }
+    return null;
+  },
+});
 
 export const list = query({
   args: {

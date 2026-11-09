@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.0.67
+
+- Adds support for file storage access in mutations.
+
+## 0.0.66
+
+- perf: only visit the queried table's documents in \_iterateDocs (#154)
+
+## 0.0.65
+
+- Adds support for Convex mutations that call the `ctx.auth.signJwt` API.
+
+## 0.0.64
+
+- Update pagination restriction to match backend: components can now call
+  `.paginate` and mutations can paginate multiple times.
+
+## 0.0.63
+
+- Pin `Date.now()`, `Date()`, and `new Date()` for each query or mutation,
+  including nested calls and `t.run`. Like the Convex backend, the pinned time
+  is at or after the transaction's snapshot timestamp and at or before the
+  `_creationTime` of documents the transaction inserts. Scheduled functions
+  still become due according to the wall clock, as in the real Convex backend.
+  (#144)
+- Enforce the 1,024-candidate limit for text search during iteration and
+  pagination, including candidates excluded by post-search filters. Queries
+  can stop early with `.take()`, smaller pages, or an early exit from iteration
+  to stay within the limit. (#169, #171)
+- Fail early when calling, scheduling, or creating a function handle for an
+  unregistered component, with an error that explains how to register it and
+  lists the registered components. (#164)
+- Preserve a stored Blob's content type in `_storage` metadata. (#170)
+
+## 0.0.62
+
+- Return typed component references from registerComponent (#161)
+
+## 0.0.61
+
+- Define a full test application with inline functions and schema without
+  generated files or an `import.meta.glob`. `defineTestApp` provides
+  schema-bound function builders, typed function references, component
+  registration, and fresh `convexTest` instances. Used primarily when testing
+  libraries and components that want to have a simple app to test with. (#140)
+- Prevent components from calling .paginate() (#157)
+- Fix text search on missing or non-string fields (#156)
+
+## 0.0.60
+
+- Improves the implementation of `finishAllScheduledFunctions` to avoid false positives in the hung scheduled function detection.
+
 ## 0.0.59
 
 - Improves global isolation, improving interactions with vitest.stubGlobal (#142).

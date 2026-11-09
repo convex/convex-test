@@ -8,7 +8,9 @@
  * @module
  */
 
+import type * as callbacks from "../callbacks.js";
 import type * as public_ from "../public.js";
+import type * as signJwt from "../signJwt.js";
 
 import type {
   ApiFromModules,
@@ -18,7 +20,9 @@ import type {
 import { anyApi, componentsGeneric } from "convex/server";
 
 const fullApi: ApiFromModules<{
+  callbacks: typeof callbacks;
   public: typeof public_;
+  signJwt: typeof signJwt;
 }> = anyApi as any;
 
 /**

@@ -23,6 +23,15 @@ import type { FunctionReference } from "convex/server";
  */
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
+    callbacks: {
+      invoke: FunctionReference<
+        "mutation",
+        "internal",
+        { fail?: boolean; handle: string; key: string },
+        null,
+        Name
+      >;
+    };
     public: {
       add: FunctionReference<
         "mutation",
@@ -89,6 +98,22 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         any,
         Name
       >;
+      paginate: FunctionReference<
+        "query",
+        "internal",
+        {
+          paginationOpts: {
+            cursor: string | null;
+            endCursor?: string | null;
+            id?: number;
+            maximumBytesRead?: number;
+            maximumRowsRead?: number;
+            numItems: number;
+          };
+        },
+        any,
+        Name
+      >;
       requestMetadata: FunctionReference<"mutation", "internal", {}, any, Name>;
       requestMetadataAction: FunctionReference<
         "action",
@@ -105,5 +130,8 @@ export type ComponentApi<Name extends string | undefined = string | undefined> =
         Name
       >;
       snapshot: FunctionReference<"query", "internal", {}, bigint, Name>;
+    };
+    signJwt: {
+      sign: FunctionReference<"mutation", "internal", {}, string, Name>;
     };
   };
