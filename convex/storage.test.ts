@@ -1,4 +1,5 @@
-import { expect, test } from "vitest";
+import { setImmediate } from "node:timers/promises";
+import { expect, test, vi } from "vitest";
 import { convexTest } from "../index";
 import { internal } from "./_generated/api";
 import type { ActionCtx } from "./_generated/server";
@@ -210,4 +211,36 @@ test("snapshot query does not see files stored in the same mutation", async () =
   expect(
     await t.mutation(internal.storage.mutationGetBlob, { id }),
   ).toMatchObject({ bytes: new Uint8Array(3).buffer });
+});
+
+test("action stores a blob while another function holds the transaction lock", async () => {
+  const t = convexTest(schema);
+  let locked!: () => void;
+  const holding = new Promise<void>((resolve) => (locked = resolve));
+  // Holds the lock until the next macrotask; the action's store below runs on
+  // microtasks alone, so it starts while this mutation is still running.
+  const holder = t.run(async () => {
+    locked();
+    await setImmediate();
+  });
+  await holding;
+  const type = "application/x-test-concurrent-store";
+  // Let the holder commit between hashing the blob and inserting its row.
+  const arrayBuffer = vi
+    .spyOn(Blob.prototype, "arrayBuffer")
+    .mockImplementation(async function (this: Blob) {
+      if (this.type === type) await holder;
+      return new Response(this).arrayBuffer();
+    });
+  try {
+    const id = await t.action(async (ctx) =>
+      ctx.storage.store(new Blob(["abc"], { type })),
+    );
+    await holder;
+    expect(
+      await t.run(async (ctx) => (await ctx.storage.get(id))?.text()),
+    ).toBe("abc");
+  } finally {
+    arrayBuffer.mockRestore();
+  }
 });

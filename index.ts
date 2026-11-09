@@ -2298,7 +2298,11 @@ function jsSyscallImpl() {
 // If we're in action, wrap the write in a transaction.
 async function writeToDatabase<T>(impl: (db: DatabaseFake) => Promise<T>) {
   const db = getDb();
-  if (!getTransactionManager().isInTransaction()) {
+  // Decide by the caller's own context, not by whether some function holds the
+  // transaction lock: an action writing while a concurrent mutation runs would
+  // otherwise write into that mutation's transaction.
+  const udfType = executionContextStorage.getStore()?.udfType;
+  if (udfType !== "mutation" && udfType !== "query") {
     return await withAuth().run(async () => {
       return await impl(db);
     });
