@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `ctx.auth.signJwt` now matches the backend's latest validation: the `aud`
+  claim is required (a non-empty string or a non-empty array of non-empty
+  strings), a random `jti` is set unless the caller passes a non-empty string,
+  and the lifetime error now says `expiresInSeconds`.
+
 ## 0.0.69
 
 - Fix storage writes in actions joining an unrelated transaction. A

@@ -35,6 +35,7 @@ test("signs an ES256 token with the given claims", async () => {
     iss: "https://some-deployment.convex.cloud",
     iat: issuedAt,
     exp: issuedAt + 60,
+    jti: expect.any(String),
   });
   expect(decodeProtectedHeader(token)).toEqual({
     alg: "ES256",
@@ -43,19 +44,45 @@ test("signs an ES256 token with the given claims", async () => {
   });
 });
 
-test("claims are optional", async () => {
+test("jti defaults to a random string", async () => {
   const t = convexTest(schema);
-  const token = await t.mutation(api.signJwt.sign, { expiresInSeconds: 1 });
-  expect(Object.keys(decodeJwt(token)).sort()).toEqual(["exp", "iat", "iss"]);
+  const sign = () =>
+    t.mutation(api.signJwt.sign, {
+      claims: { aud: "my-app" },
+      expiresInSeconds: 60,
+    });
+  const first = decodeJwt(await sign()).jti;
+  const second = decodeJwt(await sign()).jti;
+  // 16 random bytes, base64url-encoded without padding.
+  expect(first).toMatch(/^[A-Za-z0-9_-]{22}$/);
+  expect(second).not.toEqual(first);
+});
+
+test("keeps the caller's jti", async () => {
+  const t = convexTest(schema);
+  const token = await t.mutation(api.signJwt.sign, {
+    claims: { aud: "my-app", jti: "request-1" },
+    expiresInSeconds: 60,
+  });
+  expect(decodeJwt(token).jti).toEqual("request-1");
+});
+
+test("accepts an array of audiences", async () => {
+  const t = convexTest(schema);
+  const token = await t.mutation(api.signJwt.sign, {
+    claims: { aud: ["a", "b"] },
+    expiresInSeconds: 60,
+  });
+  expect(decodeJwt(token).aud).toEqual(["a", "b"]);
 });
 
 test("available in inline mutations and t.run", async () => {
   const t = convexTest(schema);
   const fromMutation = await t.mutation((ctx) =>
-    ctx.auth.signJwt({ expiresInSeconds: 60 }),
+    ctx.auth.signJwt({ claims: { aud: "my-app" }, expiresInSeconds: 60 }),
   );
   const fromRun = await t.run((ctx) =>
-    ctx.auth.signJwt({ expiresInSeconds: 60 }),
+    ctx.auth.signJwt({ claims: { aud: "my-app" }, expiresInSeconds: 60 }),
   );
   expect(decodeJwt(fromMutation).iss).toEqual(decodeJwt(fromRun).iss);
 });
@@ -69,7 +96,7 @@ test("not available in queries or actions", async () => {
 test("tokens verify against t.jwks()", async () => {
   const t = convexTest(schema);
   const token = await t.mutation(api.signJwt.sign, {
-    claims: { sub: "user123" },
+    claims: { sub: "user123", aud: "my-app" },
     expiresInSeconds: 60,
   });
   const jwks = await t.jwks();
@@ -88,6 +115,7 @@ test("tokens verify against t.jwks()", async () => {
   });
   const { payload } = await jwtVerify(token, createLocalJWKSet(jwks), {
     issuer: "https://some-deployment.convex.cloud",
+    audience: "my-app",
     algorithms: ["ES256"],
   });
   expect(payload.sub).toEqual("user123");
@@ -98,7 +126,10 @@ test("tokens verify against t.jwks()", async () => {
 test("each convexTest instance has its own key", async () => {
   const t1 = convexTest(schema);
   const t2 = convexTest(schema);
-  const token = await t1.mutation(api.signJwt.sign, { expiresInSeconds: 60 });
+  const token = await t1.mutation(api.signJwt.sign, {
+    claims: { aud: "my-app" },
+    expiresInSeconds: 60,
+  });
   await expect(
     jwtVerify(token, createLocalJWKSet(await t2.jwks())),
   ).rejects.toThrow();
@@ -107,7 +138,10 @@ test("each convexTest instance has its own key", async () => {
 test("issuer is CONVEX_CLOUD_URL", async () => {
   vi.stubEnv("CONVEX_CLOUD_URL", "https://happy-animal-123.convex.cloud/");
   const t = convexTest(schema);
-  const token = await t.mutation(api.signJwt.sign, { expiresInSeconds: 60 });
+  const token = await t.mutation(api.signJwt.sign, {
+    claims: { aud: "my-app" },
+    expiresInSeconds: 60,
+  });
   expect(decodeJwt(token).iss).toEqual("https://happy-animal-123.convex.cloud");
 });
 
@@ -134,6 +168,7 @@ test("the app calling a component signs under each one's issuer", async () => {
 test("lifetime is truncated to whole seconds", async () => {
   const t = convexTest(schema);
   const token = await t.mutation(api.signJwt.sign, {
+    claims: { aud: "my-app" },
     expiresInSeconds: 3600.9,
   });
   const { iat, exp } = decodeJwt(token);
@@ -142,12 +177,12 @@ test("lifetime is truncated to whole seconds", async () => {
 
 test.each([
   [
-    { expiresInSeconds: 0.5 },
+    { claims: { aud: "my-app" }, expiresInSeconds: 0.5 },
     "Invalid arguments for auth.signJwt: expiresInSeconds must be a number of seconds, at least 1",
   ],
   [
-    { expiresInSeconds: 3601 },
-    "expiresIn must be between 1 second and 3600 seconds",
+    { claims: { aud: "my-app" }, expiresInSeconds: 3601 },
+    "expiresInSeconds must be between 1 second and 3600 seconds",
   ],
   [
     { claims: { iss: "me" }, expiresInSeconds: 60 },
@@ -177,7 +212,38 @@ test.each([
     { claims: { sub: 123 }, expiresInSeconds: 60 },
     "The 'sub' claim must be a non-empty string",
   ],
-  [{ claims: { big: "x".repeat(8000) }, expiresInSeconds: 60 }, "byte limit"],
+  [
+    { claims: { aud: "my-app", big: "x".repeat(8000) }, expiresInSeconds: 60 },
+    "byte limit",
+  ],
+  [
+    { claims: {}, expiresInSeconds: 60 },
+    "The 'aud' claim is required. Set it to the audience that verifies the token.",
+  ],
+  [
+    { claims: { aud: "" }, expiresInSeconds: 60 },
+    "The 'aud' claim must be a non-empty string or a non-empty array of non-empty strings",
+  ],
+  [
+    { claims: { aud: [] }, expiresInSeconds: 60 },
+    "The 'aud' claim must be a non-empty string or a non-empty array of non-empty strings",
+  ],
+  [
+    { claims: { aud: ["a", ""] }, expiresInSeconds: 60 },
+    "The 'aud' claim must be a non-empty string or a non-empty array of non-empty strings",
+  ],
+  [
+    { claims: { aud: 1 }, expiresInSeconds: 60 },
+    "The 'aud' claim must be a non-empty string or a non-empty array of non-empty strings",
+  ],
+  [
+    { claims: { aud: "my-app", jti: "" }, expiresInSeconds: 60 },
+    "The 'jti' claim must be a non-empty string",
+  ],
+  [
+    { claims: { aud: "my-app", jti: 1 }, expiresInSeconds: 60 },
+    "The 'jti' claim must be a non-empty string",
+  ],
 ])("rejects %j", async (args, message) => {
   const t = convexTest(schema);
   await expect(t.mutation(api.signJwt.sign, args)).rejects.toThrow(message);
