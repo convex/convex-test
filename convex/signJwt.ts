@@ -16,12 +16,18 @@ export const signAroundComponent = mutation({
   args: {},
   returns: v.array(v.string()),
   handler: async (ctx) => {
-    const before = await ctx.auth.signJwt({ expiresInSeconds: 60 });
+    const before = await ctx.auth.signJwt({
+      claims: { aud: "test" },
+      expiresInSeconds: 60,
+    });
     const fromComponent = await ctx.runMutation(
       components.counter.signJwt.sign,
       {},
     );
-    const after = await ctx.auth.signJwt({ expiresInSeconds: 60 });
+    const after = await ctx.auth.signJwt({
+      claims: { aud: "test" },
+      expiresInSeconds: 60,
+    });
     return [before, fromComponent, after];
   },
 });

@@ -1618,9 +1618,9 @@ function mutationAuth(auth: AuthFake) {
   };
 }
 
-// Mirrors the backend's `ctx.auth.signJwt`, including its validation. Tokens
-// are signed with a key generated for the `convexTest` instance rather than
-// the deployment's key.
+// Mirrors the backend's `ctx.auth.signJwt`, including its validation and its
+// order. Tokens are signed with a key generated for the `convexTest` instance
+// rather than the deployment's key.
 async function signDeploymentJwt(options: any): Promise<string> {
   // On the backend the options cross the syscall boundary as JSON.
   const { claims = {}, expiresInSeconds } = JSON.parse(
@@ -1631,7 +1631,11 @@ async function signDeploymentJwt(options: any): Promise<string> {
       "Invalid arguments for auth.signJwt: claims must be an object",
     );
   }
-  if (typeof expiresInSeconds !== "number" || expiresInSeconds < 1) {
+  if (
+    typeof expiresInSeconds !== "number" ||
+    !Number.isFinite(expiresInSeconds) ||
+    expiresInSeconds < 1
+  ) {
     throw new Error(
       "Invalid arguments for auth.signJwt: expiresInSeconds must be a number of seconds, at least 1",
     );
@@ -1661,16 +1665,26 @@ async function signDeploymentJwt(options: any): Promise<string> {
   ) {
     throw new Error("The 'sub' claim must be a non-empty string");
   }
+  // Every token gets a `jti` so verifiers can detect replays. Callers may
+  // pick their own.
+  if (!Object.hasOwn(claims, "jti")) {
+    claims.jti = base64UrlEncodeBytes(
+      crypto.getRandomValues(new Uint8Array(16)),
+    );
+  } else if (typeof claims.jti !== "string" || claims.jti === "") {
+    throw new Error("The 'jti' claim must be a non-empty string");
+  }
   if (Object.hasOwn(claims, "nbf")) {
     throw new Error(
       "The 'nbf' claim is reserved by Convex and can't be provided",
     );
   }
+  validateDeploymentJwtAudience(claims);
   // The backend truncates the lifetime to whole seconds.
   const expiresIn = Math.floor(expiresInSeconds);
   if (expiresIn > DEPLOYMENT_JWT_MAX_LIFETIME_SECONDS) {
     throw new Error(
-      `expiresIn must be between 1 second and ${DEPLOYMENT_JWT_MAX_LIFETIME_SECONDS} seconds`,
+      `expiresInSeconds must be between 1 second and ${DEPLOYMENT_JWT_MAX_LIFETIME_SECONDS} seconds`,
     );
   }
 
@@ -1699,6 +1713,26 @@ async function signDeploymentJwt(options: any): Promise<string> {
     );
   }
   return token;
+}
+
+// Every token is signed with the same key, so `aud` is the only claim a
+// verifier can check to reject a token that was meant for another verifier.
+function validateDeploymentJwtAudience(claims: Record<string, any>) {
+  const isAudience = (aud: unknown) => typeof aud === "string" && aud !== "";
+  if (!Object.hasOwn(claims, "aud")) {
+    throw new Error(
+      "The 'aud' claim is required. Set it to the audience that verifies the token.",
+    );
+  }
+  const aud = claims.aud;
+  const valid = Array.isArray(aud)
+    ? aud.length > 0 && aud.every(isAudience)
+    : isAudience(aud);
+  if (!valid) {
+    throw new Error(
+      "The 'aud' claim must be a non-empty string or a non-empty array of non-empty strings",
+    );
+  }
 }
 
 // The app signs under the deployment's origin and a component under
