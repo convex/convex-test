@@ -248,3 +248,19 @@ test.each([
   const t = convexTest(schema);
   await expect(t.mutation(api.signJwt.sign, args)).rejects.toThrow(message);
 });
+
+test("rejects a lifetime that overflows to Infinity", async () => {
+  // A plain `Infinity` or `NaN` becomes `null` in the JSON round trip, but raw
+  // JSON text that overflows a double comes back as `Infinity`.
+  const t = convexTest(schema);
+  await expect(
+    t.run((ctx) =>
+      ctx.auth.signJwt({
+        claims: { aud: "my-app" },
+        expiresInSeconds: (JSON as any).rawJSON("1e999"),
+      }),
+    ),
+  ).rejects.toThrow(
+    "Invalid arguments for auth.signJwt: expiresInSeconds must be a number of seconds, at least 1",
+  );
+});

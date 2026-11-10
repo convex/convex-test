@@ -1715,8 +1715,8 @@ async function signDeploymentJwt(options: any): Promise<string> {
   return token;
 }
 
-// Every token is signed with the same key, so `aud` is what keeps a token
-// meant for one verifier from being accepted by another.
+// Every token is signed with the same key, so `aud` is the only claim a
+// verifier can check to reject a token that was meant for another verifier.
 function validateDeploymentJwtAudience(claims: Record<string, any>) {
   const isAudience = (aud: unknown) => typeof aud === "string" && aud !== "";
   if (!Object.hasOwn(claims, "aud")) {
