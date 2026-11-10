@@ -1611,22 +1611,30 @@ const RESERVED_JWT_CLAIM_PREFIXES = ["convex", "cvx"];
 const DEFAULT_CONVEX_CLOUD_URL = "https://some-deployment.convex.cloud";
 
 // `ctx.auth` in mutations, which can also sign JWTs with the deployment's key.
+// Signing goes through the `1.0/signJwt` syscall, like `convex/server` does.
 function mutationAuth(auth: AuthFake) {
   return {
     getUserIdentity: () => auth.getUserIdentity(),
-    signJwt: (options: any) => signDeploymentJwt(options),
+    signJwt: async (options: any) =>
+      JSON.parse(
+        await getSyscalls().asyncSyscall(
+          "1.0/signJwt",
+          JSON.stringify(options ?? {}),
+        ),
+      ),
   };
 }
 
-// Mirrors the backend's `ctx.auth.signJwt`, including its validation and its
-// order. Tokens are signed with a key generated for the `convexTest` instance
-// rather than the deployment's key.
-async function signDeploymentJwt(options: any): Promise<string> {
-  // On the backend the options cross the syscall boundary as JSON.
-  const { claims = {}, expiresInSeconds } = JSON.parse(
-    JSON.stringify(options ?? {}),
-  );
-  if (typeof claims !== "object" || claims === null || Array.isArray(claims)) {
+// Mirrors the backend's `1.0/signJwt` syscall, including its validation and
+// its order. Tokens are signed with a key generated for the `convexTest`
+// instance rather than the deployment's key.
+async function signDeploymentJwt(args: any): Promise<string> {
+  const { claims: rawClaims = {}, expiresInSeconds } = args ?? {};
+  if (
+    typeof rawClaims !== "object" ||
+    rawClaims === null ||
+    Array.isArray(rawClaims)
+  ) {
     throw new Error(
       "Invalid arguments for auth.signJwt: claims must be an object",
     );
@@ -1640,6 +1648,7 @@ async function signDeploymentJwt(options: any): Promise<string> {
       "Invalid arguments for auth.signJwt: expiresInSeconds must be a number of seconds, at least 1",
     );
   }
+  const claims: Record<string, any> = { ...rawClaims };
   for (const reserved of ["iss", "iat", "exp"]) {
     if (Object.hasOwn(claims, reserved)) {
       throw new Error(
@@ -2298,6 +2307,26 @@ function asyncSyscallImpl() {
       }
       case "1.0/auditLog": {
         return JSON.stringify(null);
+      }
+      case "1.0/signJwt": {
+        // Signing reads the current time, which query caching could serve
+        // stale, so the backend only allows it in mutations. Actions don't
+        // route this syscall at all.
+        const udfType = executionContextStorage.getStore()?.udfType;
+        if (udfType === "query") {
+          throw new Error(
+            "ctx.auth.signJwt() can't be called from a query. Call it from a mutation.",
+          );
+        }
+        if (udfType !== "mutation") {
+          throw new Error(`Unknown async operation ${op}`);
+        }
+        return JSON.stringify(await signDeploymentJwt(args));
+      }
+      case "1.0/getDeploymentJwks": {
+        // Allowed everywhere: the keys are deployment state, not a fresh
+        // value like a token's `iat` and `exp`.
+        return JSON.stringify(await deploymentJwks());
       }
       default: {
         throw new Error(

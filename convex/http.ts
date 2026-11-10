@@ -1,6 +1,7 @@
 import { httpRouter } from "convex/server";
 import { api, internal } from "./_generated/api";
 import { httpAction, internalQuery } from "./_generated/server";
+import { jwksFromHttpAction } from "./signJwt";
 
 const http = httpRouter();
 
@@ -83,6 +84,12 @@ http.route({
     const nested = await ctx.runQuery(internal.globals.readAtob);
     return Response.json({ before, nested, after: atob("aGVsbG8=") });
   }),
+});
+
+http.route({
+  path: "/deploymentJwks",
+  method: "GET",
+  handler: jwksFromHttpAction,
 });
 
 export default http;

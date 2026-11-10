@@ -264,3 +264,61 @@ test("rejects a lifetime that overflows to Infinity", async () => {
     "Invalid arguments for auth.signJwt: expiresInSeconds must be a number of seconds, at least 1",
   );
 });
+
+test("the 1.0/signJwt syscall signs in mutations", async () => {
+  const t = convexTest(schema);
+  const token = await t.mutation(api.signJwt.signViaSyscall, {
+    claims: { sub: "user123", aud: "my-app" },
+    expiresInSeconds: 60,
+  });
+  const { payload } = await jwtVerify(token, createLocalJWKSet(await t.jwks()));
+  expect(payload).toMatchObject({
+    sub: "user123",
+    aud: "my-app",
+    iss: "https://some-deployment.convex.cloud",
+  });
+});
+
+test("the 1.0/signJwt syscall validates like ctx.auth.signJwt", async () => {
+  const t = convexTest(schema);
+  await expect(
+    t.mutation(api.signJwt.signViaSyscall, { expiresInSeconds: 60 }),
+  ).rejects.toThrow("The 'aud' claim is required");
+});
+
+test("the 1.0/signJwt syscall is rejected in queries", async () => {
+  const t = convexTest(schema);
+  await expect(t.query(api.signJwt.signInQueryViaSyscall)).rejects.toThrow(
+    "ctx.auth.signJwt() can't be called from a query. Call it from a mutation.",
+  );
+});
+
+test("the 1.0/signJwt syscall is rejected in actions", async () => {
+  const t = convexTest(schema);
+  await expect(t.action(api.signJwt.signInActionViaSyscall)).rejects.toThrow(
+    "Unknown async operation 1.0/signJwt",
+  );
+});
+
+test("the 1.0/getDeploymentJwks syscall returns t.jwks() everywhere", async () => {
+  const t = convexTest(schema);
+  const jwks = await t.jwks();
+  expect(await t.query(api.signJwt.jwksFromQuery)).toEqual(jwks);
+  expect(await t.mutation(api.signJwt.jwksFromMutation)).toEqual(jwks);
+  expect(await t.action(api.signJwt.jwksFromAction)).toEqual(jwks);
+  const response = await t.fetch("/deploymentJwks");
+  expect(await response.json()).toEqual(jwks);
+});
+
+test("the 1.0/getDeploymentJwks syscall verifies tokens from the deployment", async () => {
+  const t = convexTest(schema);
+  // Read the keys before anything was signed: they must still match.
+  const jwks = await t.query(api.signJwt.jwksFromQuery);
+  const token = await t.mutation(api.signJwt.sign, {
+    claims: { aud: "my-app" },
+    expiresInSeconds: 60,
+  });
+  await expect(
+    jwtVerify(token, createLocalJWKSet(jwks), { audience: "my-app" }),
+  ).resolves.toBeDefined();
+});
