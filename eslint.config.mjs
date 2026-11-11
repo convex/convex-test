@@ -62,6 +62,7 @@ export default defineConfig([
     },
   },
   globalIgnores([
+    ".claude/**",
     ".context/**",
     "**/.eslintrc.cjs",
     "**/_generated/**",
