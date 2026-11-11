@@ -1,6 +1,16 @@
 import { v } from "convex/values";
 import { components } from "./_generated/api";
-import { action, mutation, query } from "./_generated/server";
+import { action, httpAction, mutation, query } from "./_generated/server";
+
+// The `Convex` global stays reachable from any function, so code can make
+// syscalls directly, bypassing what `ctx` exposes.
+declare const Convex: {
+  asyncSyscall: (op: string, jsonArgs: string) => Promise<string>;
+};
+
+async function asyncSyscall(op: string, args: unknown) {
+  return JSON.parse(await Convex.asyncSyscall(op, JSON.stringify(args)));
+}
 
 export const sign = mutation({
   args: { claims: v.optional(v.any()), expiresInSeconds: v.number() },
@@ -43,3 +53,51 @@ export const signFromAction = action({
   returns: v.boolean(),
   handler: async (ctx) => "signJwt" in ctx.auth,
 });
+
+export const signViaSyscall = mutation({
+  args: { claims: v.optional(v.any()), expiresInSeconds: v.number() },
+  returns: v.string(),
+  handler: async (_ctx, args) => await asyncSyscall("1.0/signJwt", args),
+});
+
+export const signInQueryViaSyscall = query({
+  args: {},
+  returns: v.string(),
+  handler: async () =>
+    await asyncSyscall("1.0/signJwt", {
+      claims: { aud: "test" },
+      expiresInSeconds: 60,
+    }),
+});
+
+export const signInActionViaSyscall = action({
+  args: {},
+  returns: v.string(),
+  handler: async () =>
+    await asyncSyscall("1.0/signJwt", {
+      claims: { aud: "test" },
+      expiresInSeconds: 60,
+    }),
+});
+
+export const jwksFromQuery = query({
+  args: {},
+  returns: v.any(),
+  handler: async () => await asyncSyscall("1.0/getDeploymentJwks", {}),
+});
+
+export const jwksFromMutation = mutation({
+  args: {},
+  returns: v.any(),
+  handler: async () => await asyncSyscall("1.0/getDeploymentJwks", {}),
+});
+
+export const jwksFromAction = action({
+  args: {},
+  returns: v.any(),
+  handler: async () => await asyncSyscall("1.0/getDeploymentJwks", {}),
+});
+
+export const jwksFromHttpAction = httpAction(async () =>
+  Response.json(await asyncSyscall("1.0/getDeploymentJwks", {})),
+);
