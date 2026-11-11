@@ -1,6 +1,6 @@
 {
   "name": "convex-test",
-  "version": "0.0.69",
+  "version": "0.0.70",
   "description": "A JS mock of the Convex backend for testing your Convex functions.",
   "keywords": [
     "test",

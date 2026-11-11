@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.0.70
 
 - `ctx.auth.signJwt` now matches the backend's latest validation: the `aud`
   claim is required (a non-empty string or a non-empty array of non-empty
