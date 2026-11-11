@@ -6,3 +6,4 @@ coverage
 .env.local
 *.tgz
 .envrc
+.claude/worktrees
