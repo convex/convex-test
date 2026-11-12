@@ -2,8 +2,6 @@
 
 ## Installation
 
-Use Node.js 24:
-
 ```sh
 npm ci
 ```
