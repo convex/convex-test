@@ -34,6 +34,6 @@ Keep the version PR open until a release is wanted.
 For a manual version PR, run `npx changeset version`. Prepare prerelease versions
 and changelog entries manually, with no pending Changesets.
 
-If staging fails, check npm before retrying **Release** with the version-bump
-commit SHA. If staging succeeded but tagging failed, rerun only the failed `tag`
-job; a staged version cannot be reused. Source fixes need a new version.
+If staging fails, check npm before retrying **Release** from main with the full
+version-bump commit SHA. If staging succeeded but tagging failed, rerun only the
+failed `tag` job; a staged version cannot be reused. Source fixes need a new version.
