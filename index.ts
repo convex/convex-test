@@ -3678,8 +3678,11 @@ function withAuth(
     functionPath: FunctionPath,
     isNested: boolean,
     transactionLimits?: Partial<TransactionMetrics>,
+    isInternal = false,
   ): Promise<T> => {
-    const m = mutationGeneric({
+    // The wrapper decides what `ctx.meta.getFunctionMetadata()` reports as the
+    // function's visibility, so match how the function was registered.
+    const m = (isInternal ? internalMutationGeneric : mutationGeneric)({
       handler: (ctx: any, a: any) => {
         const testCtx = {
           ...ctx,
@@ -3747,8 +3750,9 @@ function withAuth(
     functionPath: FunctionPath,
     isNested: boolean,
     transactionLimits?: Partial<TransactionMetrics>,
+    isInternal = false,
   ): Promise<T> => {
-    const q = queryGeneric({
+    const q = (isInternal ? internalQueryGeneric : queryGeneric)({
       handler: (ctx: any, a: any) => {
         const testCtx = { ...ctx, auth: authStorage.getStore() ?? auth };
         return runWithGlobalOverrides(transactionGlobalOverrides(), () =>
@@ -3814,8 +3818,9 @@ function withAuth(
     ctxRunQuery: any,
     ctxRunMutation: any,
     ctxRunAction: any,
+    isInternal = false,
   ): Promise<T> => {
-    const a = actionGeneric({
+    const a = (isInternal ? internalActionGeneric : actionGeneric)({
       handler: (ctx: any, innerArgs: any) => {
         const testCtx = {
           ...ctx,
@@ -3888,6 +3893,7 @@ function withAuth(
           resolved.functionPath,
           isNested,
           transactionLimits,
+          resolved.isInternal,
         );
         validateReturnValue(
           resolved.returns,
@@ -3933,6 +3939,7 @@ function withAuth(
           // (we're inside a mutation that already holds it).
           /* isNested */ true,
           transactionLimits,
+          resolved.isInternal,
         );
         validateReturnValue(
           resolved.returns,
@@ -3975,6 +3982,7 @@ function withAuth(
           resolved.functionPath,
           isNested,
           transactionLimits,
+          resolved.isInternal,
         );
         validateReturnValue(
           resolved.returns,
@@ -4007,6 +4015,7 @@ function withAuth(
         byTypeWithPath.runQuery,
         byTypeWithPath.runMutation,
         byTypeWithPath.runAction,
+        resolved.isInternal,
       );
       validateReturnValue(
         resolved.returns,
@@ -4416,6 +4425,7 @@ async function resolveFunction<T extends RegisteredFunctionKind>(
   handler: (ctx: any, args: any) => any;
   returns: ValidatorJSON | null;
   args: ValidatorJSON;
+  isInternal: boolean;
 }> {
   // "queries/messages:list" -> ["queries/messages", "list"]
   const [modulePath, maybeExportName] = functionPath.udfPath.split(":");
@@ -4477,7 +4487,9 @@ async function resolveFunction<T extends RegisteredFunctionKind>(
   }
   const returns = JSON.parse(func.exportReturns());
 
-  return { func, functionPath, handler, returns, args };
+  const isInternal = (func as { isInternal?: boolean }).isInternal === true;
+
+  return { func, functionPath, handler, returns, args, isInternal };
 }
 
 function simpleHash(string: string) {

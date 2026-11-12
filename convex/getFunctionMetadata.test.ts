@@ -3,7 +3,7 @@
 import { expect, test } from "vitest";
 import { convexTest } from "../index";
 import schema from "./schema";
-import { api, components } from "./_generated/api";
+import { api, components, internal } from "./_generated/api";
 import counterSchema from "./counter/component/schema";
 
 const counterModules = import.meta.glob("./counter/component/**/*.ts");
@@ -78,6 +78,72 @@ test("named action", async () => {
     type: "action",
     visibility: "public",
   });
+});
+
+test("internal query", async () => {
+  const t = convexTest({ schema });
+  const metadata = await t.query(
+    internal.getFunctionMetadata.internalMetadataQuery,
+  );
+  expect(metadata).toEqual({
+    name: "getFunctionMetadata:internalMetadataQuery",
+    componentPath: "",
+    type: "query",
+    visibility: "internal",
+  });
+});
+
+test("internal mutation", async () => {
+  const t = convexTest({ schema });
+  const metadata = await t.mutation(
+    internal.getFunctionMetadata.internalMetadataMutation,
+  );
+  expect(metadata).toEqual({
+    name: "getFunctionMetadata:internalMetadataMutation",
+    componentPath: "",
+    type: "mutation",
+    visibility: "internal",
+  });
+});
+
+test("internal action", async () => {
+  const t = convexTest({ schema });
+  const metadata = await t.action(
+    internal.getFunctionMetadata.internalMetadataAction,
+  );
+  expect(metadata).toEqual({
+    name: "getFunctionMetadata:internalMetadataAction",
+    componentPath: "",
+    type: "action",
+    visibility: "internal",
+  });
+});
+
+test("internal functions called from an action", async () => {
+  const t = convexTest({ schema });
+  const metadata = await t.action(
+    api.getFunctionMetadata.nestedInternalMetadata,
+  );
+  expect(metadata).toEqual([
+    {
+      name: "getFunctionMetadata:internalMetadataQuery",
+      componentPath: "",
+      type: "query",
+      visibility: "internal",
+    },
+    {
+      name: "getFunctionMetadata:internalMetadataMutation",
+      componentPath: "",
+      type: "mutation",
+      visibility: "internal",
+    },
+    {
+      name: "getFunctionMetadata:internalMetadataAction",
+      componentPath: "",
+      type: "action",
+      visibility: "internal",
+    },
+  ]);
 });
 
 test("default export", async () => {
