@@ -20,7 +20,7 @@ test("insert rejects a document larger than 1 MiB", async () => {
   expect(await t.run((ctx) => ctx.db.query("messages").collect())).toEqual([]);
 });
 
-test("insert accepts a document just under 1 MiB", async () => {
+test("insert accepts a document of exactly 1 MiB", async () => {
   const t = convexTest(schema);
   const id = await t.run((ctx) =>
     ctx.db.insert("messages", { author: "sarah", body: "" }),
