@@ -166,6 +166,19 @@ const nestedTxStorage = new AsyncLocalStorage<NestedLock>();
 const authStorage = new AsyncLocalStorage<AuthFake>();
 const convexGlobalStorage = new AsyncLocalStorage<ConvexGlobal>();
 
+// A table definition's exported validator and indexes, built once per definition. Every `convexTest`
+// instance validates against the same schema and only reads what `export()` returns, and exporting
+// is most of what constructing an instance costs, so instances share it.
+const exportedTables = new WeakMap<object, any>();
+function exportTable(tableSchema: unknown) {
+  let exported = exportedTables.get(tableSchema as object);
+  if (exported === undefined) {
+    exported = (tableSchema as any).export();
+    exportedTables.set(tableSchema as object, exported);
+  }
+  return exported;
+}
+
 class DatabaseFake {
   private _componentPath: string;
   private _documents: Record<DocumentId, StoredDocument> = {};
@@ -217,7 +230,7 @@ class DatabaseFake {
             tables: new Map(
               Object.entries(schema.tables).map(([name, tableSchema]) => [
                 name,
-                (tableSchema as any).export(),
+                exportTable(tableSchema),
               ]),
             ),
           };
