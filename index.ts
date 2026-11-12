@@ -2144,8 +2144,14 @@ function asyncSyscallImpl() {
       }
 
       case "1.0/actions/schedule": {
+        // The wrapper transaction's pinned time can be ahead of the action's
+        // clock, so pass the action's own time along.
+        const scheduledFromMs = frameworkNow();
         return await withAuth().run(async () => {
-          return await getSyscalls().asyncSyscall("1.0/schedule", jsonArgs);
+          return await getSyscalls().asyncSyscall(
+            "1.0/schedule",
+            JSON.stringify({ ...args, scheduledFromMs }),
+          );
         });
       }
       case "1.0/schedule": {
@@ -2155,6 +2161,7 @@ function asyncSyscallImpl() {
           functionHandle,
           args: fnArgs,
           ts: tsInSecs,
+          scheduledFromMs = getTransactionManager().getTime(),
         } = args;
         const functionAddress = { name, reference, functionHandle };
         const functionPath = getFunctionPathFromAddress(functionAddress);
@@ -2184,12 +2191,16 @@ function asyncSyscallImpl() {
         // original ALS context) uses the correct test state.
         const capturedGlobal = getConvexGlobal();
         const scheduler = capturedGlobal.scheduler;
+        // Like the backend, a function scheduled at or before the scheduling
+        // function's time runs right after it, and any other function waits
+        // until the clock reaches its time.
+        const runsImmediately = tsInSecs <= scheduledFromMs / 1000;
         // Queue the setTimeout outside any nested-mutation ALS context so
         // the scheduled function starts as a fresh top-level execution
         // rather than inheriting a stale parent lock.
         nestedTxStorage.exit(() => {
           scheduler.timerScheduled();
-          frameworkSetTimeout(
+          frameworkSetTimeoutAt(
             () => {
               scheduler.timerFired();
               const promise = convexGlobalStorage
@@ -2208,9 +2219,7 @@ function asyncSyscallImpl() {
                 });
               scheduler.add(promise);
             },
-            // Like the backend's scheduler, measure the due time against the
-            // wall clock, not the scheduling transaction's pinned time.
-            Math.max(0, tsInSecs * 1000 - frameworkNow()),
+            runsImmediately ? 0 : tsInSecs,
           );
         });
         return JSON.stringify(convexToJson(jobId));
@@ -3111,6 +3120,28 @@ function frameworkSetTimeout(
   ms?: number,
 ): ReturnType<typeof setTimeout> {
   return globalOverridesStorage.exit(() => globalThis.setTimeout(cb, ms));
+}
+
+// Call `cb` once `frameworkNow()` reaches `dueSecs`, compared in seconds:
+// `dueSecs * 1000` can land just above or below the millisecond it came from.
+// Like the backend's scheduler, this measures the wall clock, not the
+// scheduling transaction's pinned time.
+function frameworkSetTimeoutAt(cb: () => void, dueSecs: number): void {
+  const now = frameworkNow();
+  if (dueSecs <= now / 1000) {
+    frameworkSetTimeout(cb, 0);
+    return;
+  }
+  frameworkSetTimeout(
+    () => {
+      if (dueSecs <= frameworkNow() / 1000) {
+        cb();
+      } else {
+        frameworkSetTimeoutAt(cb, dueSecs);
+      }
+    },
+    Math.max(1, Math.floor(dueSecs * 1000 - now)),
+  );
 }
 
 // Globals that the real Convex runtime does not provide inside queries and
