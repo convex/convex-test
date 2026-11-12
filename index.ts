@@ -81,9 +81,7 @@ function checkDocumentSize(tableName: string, document: StoredDocument) {
 }
 
 type FilterJson =
-  | { $eq: [FilterJson, FilterJson] }
-  | { $field: string }
-  | JSONValue;
+  { $eq: [FilterJson, FilterJson] } | { $field: string } | JSONValue;
 
 type QueryOperator = { filter: FilterJson } | { limit: number };
 type Source =
@@ -366,7 +364,7 @@ class DatabaseFake {
       convexValue[key] = evaluateValue(v);
     }
     const merged = { ...fields, ...convexValue };
-    const table = tableNameFromId(_id as string)!;
+    const table = tableNameFromId(_id)!;
     this._validate(table, merged);
     const patched = { _id, _creationTime, ...merged };
     checkDocumentSize(table, patched);
@@ -411,7 +409,7 @@ class DatabaseFake {
     for (const [key, v] of Object.entries(value)) {
       convexValue[key] = evaluateValue(v);
     }
-    const table = tableNameFromId(document._id as string)!;
+    const table = tableNameFromId(document._id)!;
     this._validate(table, convexValue);
     const replacement = {
       ...convexValue,
@@ -1857,8 +1855,7 @@ async function runScheduledFunction({
         componentPath,
         async () => {
           const job = db.get("_scheduled_functions", jobId) as
-            | ScheduledFunction
-            | undefined;
+            ScheduledFunction | undefined;
           if (!job) return true;
           if (job.state.kind === "canceled") {
             return true;
@@ -2442,9 +2439,9 @@ type ComponentRegistrations = Record<
 >;
 
 type RegisteredComponents<Components extends ComponentRegistrations> = {
-  [Name in keyof Components]: Components[Name]["register"] extends ComponentRegistration<
-    infer Api
-  >
+  [
+    Name in keyof Components
+  ]: Components[Name]["register"] extends ComponentRegistration<infer Api>
     ? ComponentApiForName<Api, Name & string>
     : never;
 };
