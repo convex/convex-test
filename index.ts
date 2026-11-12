@@ -64,9 +64,7 @@ const TYPICAL_CONVEX_ID_LENGTH = 32;
 const MAX_SEARCH_CANDIDATE_REVISIONS = 1024;
 
 type FilterJson =
-  | { $eq: [FilterJson, FilterJson] }
-  | { $field: string }
-  | JSONValue;
+  { $eq: [FilterJson, FilterJson] } | { $field: string } | JSONValue;
 
 type QueryOperator = { filter: FilterJson } | { limit: number };
 type Source =
@@ -347,7 +345,7 @@ class DatabaseFake {
       convexValue[key] = evaluateValue(v);
     }
     const merged = { ...fields, ...convexValue };
-    this._validate(tableNameFromId(_id as string)!, merged);
+    this._validate(tableNameFromId(_id)!, merged);
     this._addWrite(id, { _id, _creationTime, ...merged });
   }
 
@@ -389,7 +387,7 @@ class DatabaseFake {
     for (const [key, v] of Object.entries(value)) {
       convexValue[key] = evaluateValue(v);
     }
-    this._validate(tableNameFromId(document._id as string)!, convexValue);
+    this._validate(tableNameFromId(document._id)!, convexValue);
     this._addWrite(id, {
       ...convexValue,
       _id: document._id,
@@ -1832,8 +1830,7 @@ async function runScheduledFunction({
         componentPath,
         async () => {
           const job = db.get("_scheduled_functions", jobId) as
-            | ScheduledFunction
-            | undefined;
+            ScheduledFunction | undefined;
           if (!job) return true;
           if (job.state.kind === "canceled") {
             return true;
@@ -2417,9 +2414,9 @@ type ComponentRegistrations = Record<
 >;
 
 type RegisteredComponents<Components extends ComponentRegistrations> = {
-  [Name in keyof Components]: Components[Name]["register"] extends ComponentRegistration<
-    infer Api
-  >
+  [
+    Name in keyof Components
+  ]: Components[Name]["register"] extends ComponentRegistration<infer Api>
     ? ComponentApiForName<Api, Name & string>
     : never;
 };
