@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.71
+
+### Patch Changes
+
+- b5ebc20: Reject user documents larger than 1 MiB on `insert`, `patch`, and `replace`, matching Convex's document-size limit. Size includes system fields and counts strings in UTF-8 bytes. Fixes #176. (#183, thanks @Mohith26!)
+- 42a868d: Fix `ctx.meta.getFunctionMetadata()` reporting public visibility for internal queries, mutations, and actions, including nested calls. (#195, #196)
+
 ## 0.0.70
 
 - `ctx.auth.signJwt` now matches the backend's latest validation: the `aud`
