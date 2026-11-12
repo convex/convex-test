@@ -20,7 +20,7 @@
   ],
   "scripts": {
     "format": "prettier --write .",
-    "prebuild": "npm run lint && npm run typecheck && npm run test:once",
+    "prebuild": "npm run check",
     "build": "tsc && replace-in-file '\"./convex/**/*.*s\"' '\"../../../convex/**/*.*s\"' ./dist/index.js",
     "lint": "eslint . --report-unused-disable-directives --max-warnings 0 && prettier --check .",
     "typecheck": "tsc -p convex/tsconfig.json",
@@ -29,11 +29,8 @@
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
     "test:coverage": "vitest run --coverage",
     "clean": "rm -rf dist",
-    "alpha": "npm version prerelease --preid alpha && npm publish --tag alpha && git push --follow-tags",
-    "release": "npm version patch && npm publish && git push --follow-tags",
-    "preversion": "npm run clean && npm ci && npm run build",
-    "version": "(npm whoami || npm login) && vim -c 'normal o' -c 'normal o## '$npm_package_version CHANGELOG.md && prettier -w CHANGELOG.md && git add CHANGELOG.md",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "check": "npm run lint && npm run typecheck && npm run test:once"
   },
   "author": "Sarah Shader & Michal Srb <srb@convex.dev>",
   "license": "Apache-2.0",
@@ -41,6 +38,7 @@
     "convex": "^1.43.0"
   },
   "devDependencies": {
+    "@changesets/cli": "3.0.3",
     "@edge-runtime/vm": "5.0.0",
     "@eslint/eslintrc": "3.3.5",
     "@eslint/js": "10.0.1",

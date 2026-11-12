@@ -1,10 +1,5 @@
 # Changelog
 
-## Unreleased
-
-- Fix `ctx.meta.getFunctionMetadata()` reporting public visibility for internal
-  queries, mutations, and actions, including nested calls. (#195, #196)
-
 ## 0.0.70
 
 - `ctx.auth.signJwt` now matches the backend's latest validation: the `aud`
