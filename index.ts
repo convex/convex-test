@@ -648,7 +648,6 @@ class DatabaseFake {
           // At or past end cursor — include this doc if exactly at cursor, then stop
           if (cmp === 0) {
             rowsRead += 1;
-            bytesRead += getDocumentSize(doc);
             readDocCursors.push(this._encodeCursor(doc, cursorFields));
             if (filterFn(doc)) {
               page.push(doc);
@@ -4324,6 +4323,7 @@ function validateReturnValue(
     } catch (e) {
       throw new Error(
         `Return value validation failed for ${functionType} "${functionPath.udfPath}":\n${(e as Error).message}`,
+        { cause: e },
       );
     }
   }
