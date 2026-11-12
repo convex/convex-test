@@ -63,6 +63,23 @@ import {
 const TYPICAL_CONVEX_ID_LENGTH = 32;
 const MAX_SEARCH_CANDIDATE_REVISIONS = 1024;
 
+// Matches MAX_USER_SIZE in the Convex backend: a document, including its
+// system fields, may be at most 1 MiB.
+const MAX_DOCUMENT_SIZE = 1 << 20;
+
+function checkDocumentSize(tableName: string, document: StoredDocument) {
+  // System tables such as `_scheduled_functions` have their own limits.
+  if (tableName.startsWith("_")) {
+    return;
+  }
+  const size = getDocumentSize(document);
+  if (size > MAX_DOCUMENT_SIZE) {
+    throw new Error(
+      `Value is too large (${size} bytes > maximum size ${MAX_DOCUMENT_SIZE} bytes)`,
+    );
+  }
+}
+
 type FilterJson =
   | { $eq: [FilterJson, FilterJson] }
   | { $field: string }
@@ -302,8 +319,10 @@ class DatabaseFake {
     const now = Date.now();
     const _creationTime =
       now <= this._lastCreationTime ? this._lastCreationTime + 0.001 : now;
+    const document = { ...value, _id, _creationTime };
+    checkDocumentSize(table, document);
     this._lastCreationTime = _creationTime;
-    this._addWrite(_id, { ...value, _id, _creationTime });
+    this._addWrite(_id, document);
     return _id;
   }
 
@@ -347,8 +366,11 @@ class DatabaseFake {
       convexValue[key] = evaluateValue(v);
     }
     const merged = { ...fields, ...convexValue };
-    this._validate(tableNameFromId(_id as string)!, merged);
-    this._addWrite(id, { _id, _creationTime, ...merged });
+    const table = tableNameFromId(_id as string)!;
+    this._validate(table, merged);
+    const patched = { _id, _creationTime, ...merged };
+    checkDocumentSize(table, patched);
+    this._addWrite(id, patched);
   }
 
   replace<Table extends TableName>(
@@ -389,12 +411,15 @@ class DatabaseFake {
     for (const [key, v] of Object.entries(value)) {
       convexValue[key] = evaluateValue(v);
     }
-    this._validate(tableNameFromId(document._id as string)!, convexValue);
-    this._addWrite(id, {
+    const table = tableNameFromId(document._id as string)!;
+    this._validate(table, convexValue);
+    const replacement = {
       ...convexValue,
       _id: document._id,
       _creationTime: document._creationTime,
-    });
+    };
+    checkDocumentSize(table, replacement);
+    this._addWrite(id, replacement);
   }
 
   delete<Table extends TableName>(
