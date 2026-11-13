@@ -49,7 +49,7 @@
     "convex": "1.49.0",
     "eslint": "10.14.0",
     "globals": "17.14.0",
-    "jose": "6.2.12",
+    "jose": "6.2.17",
     "pkg-pr-new": "0.0.93",
     "prettier": "3.9.10",
     "replace-in-file": "9.0.0",
