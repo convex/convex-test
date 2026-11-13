@@ -60,11 +60,15 @@ const modules = {
       },
     }),
     action: app.internalAction({
-      args: {},
+      args: { nested: v.optional(v.boolean()) },
       returns: v.null(),
-      handler: async (ctx) => {
+      handler: async (ctx, { nested }) => {
         const id = (await ctx.meta.getRequestMetadata()).scheduledFunctionId!;
-        await ctx.scheduler.cancel(id as GenericId<"_scheduled_functions">);
+        if (nested) {
+          await ctx.runMutation(anyApi.selfCancel.cancel, { id });
+        } else {
+          await ctx.scheduler.cancel(id as GenericId<"_scheduled_functions">);
+        }
         return null;
       },
     }),
@@ -181,3 +185,40 @@ test("a child component cannot cancel its parent scheduled mutation", async () =
   expect(job?.state.kind).toBe("failed");
   expect(messages).toEqual([]);
 });
+
+test.each([
+  { version: "1.49.0", state: "success" },
+  { version: "1.50.0", state: "failed" },
+])(
+  "a mutation called by a scheduled action follows $version cancellation behavior",
+  async ({ version, state }) => {
+    runtime.version = version;
+    const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    const t = fixture.createTest();
+    const id = await t.mutation(async (ctx) =>
+      ctx.scheduler.runAfter(0, fixture.internal.selfCancel.action, {
+        nested: true,
+      }),
+    );
+    vi.runAllTimers();
+    await t.finishInProgressScheduledFunctions();
+    expect(
+      (await t.query(async (ctx) => ctx.db.system.get(id)))?.state.kind,
+    ).toBe(state);
+    if (state === "success") {
+      expect(warnings).toHaveBeenCalledWith(
+        expect.stringContaining("deprecated"),
+      );
+      expect(errors).not.toHaveBeenCalled();
+    } else {
+      expect(errors).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          message: expect.stringContaining("ScheduledFunctionCancelingItself"),
+        }),
+      );
+      expect(warnings).not.toHaveBeenCalled();
+    }
+  },
+);

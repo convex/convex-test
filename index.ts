@@ -178,7 +178,6 @@ class NestedLock {
 
 const nestedTxStorage = new AsyncLocalStorage<NestedLock>();
 const authStorage = new AsyncLocalStorage<AuthFake>();
-const scheduledMutationStorage = new AsyncLocalStorage<string | undefined>();
 const convexGlobalStorage = new AsyncLocalStorage<ConvexGlobal>();
 
 class DatabaseFake {
@@ -1875,11 +1874,7 @@ async function runScheduledFunction({
         return;
       }
       try {
-        const { func } = await resolveFunction(functionPath, "any");
-        await scheduledMutationStorage.run(
-          func.isMutation ? jobId : undefined,
-          () => withAuth().fun(functionPath, args),
-        );
+        await withAuth().fun(functionPath, args);
       } catch (error) {
         console.error(`Error when running scheduled function ${name}`, error);
         await withAuth().runInComponent(componentPath, async () => {
@@ -2221,7 +2216,11 @@ function asyncSyscallImpl() {
       }
       case "1.0/actions/cancel_job": {
         await withAuth().run(async () => {
-          await getSyscalls().asyncSyscall("1.0/cancel_job", jsonArgs);
+          // Actions may cancel their own job; only mutation cancellation
+          // checks the scheduled request ID.
+          db.patch("_scheduled_functions", args.id, {
+            state: { kind: "canceled" },
+          });
         });
         return JSON.stringify({});
       }
@@ -2241,7 +2240,7 @@ function asyncSyscallImpl() {
       }
       case "1.0/cancel_job": {
         const { id } = args;
-        if (scheduledMutationStorage.getStore() === id) {
+        if (requestMetadataStorage.getStore()?.scheduledFunctionId === id) {
           // The backend gates this on the function's installed Convex version.
           const [release, prerelease] = version.split("+")[0].split("-");
           const [major, minor, patch] = release.split(".").map(Number);
