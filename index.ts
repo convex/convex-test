@@ -10,6 +10,8 @@ import {
   DocumentByName,
   FilterApi,
   FunctionReference,
+  FunctionReference_future,
+  FunctionReturnType,
   GenericActionCtx,
   GenericDataModel,
   GenericDocument,
@@ -18,6 +20,7 @@ import {
   GenericSchema,
   HttpRouter,
   MutationBuilder,
+  OptionalRestArgs,
   PublicHttpAction,
   QueryBuilder,
   RegisteredAction,
@@ -2655,32 +2658,8 @@ export function defineTestApp<
   };
 }
 
-// Structural compatibility keeps declarations usable with Convex 1.43,
-// which does not export FunctionReference_future or its signature helpers.
 type FunctionReferenceLike<Type extends "query" | "mutation" | "action"> =
-  | FunctionReference<Type, any>
-  | {
-      _type: Type;
-      _visibility: "public" | "internal";
-      _componentPath: string | undefined;
-      _fn?: ((args: any, keys: never) => any) | undefined;
-    };
-
-type ReferenceSignature<Ref> = Ref extends {
-  _args: infer Args;
-  _returnType: infer Result;
-}
-  ? { args: Args; result: Result }
-  : Ref extends {
-        _fn?: ((args: infer Args, keys: never) => infer Result) | undefined;
-      }
-    ? { args: Args; result: Result }
-    : never;
-
-type ReferenceArgs<Ref> =
-  ReferenceSignature<Ref>["args"] extends Record<string, never>
-    ? [args?: Record<string, never>]
-    : [args: ReferenceSignature<Ref>["args"]];
+  FunctionReference<Type, any> | FunctionReference_future<Type, any>;
 
 export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   /**
@@ -2699,11 +2678,11 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   >(
     queryOrFunc: QueryOrFunc,
     ...args: QueryOrFunc extends FunctionReferenceLike<"query">
-      ? ReferenceArgs<QueryOrFunc>
+      ? OptionalRestArgs<QueryOrFunc>
       : []
   ) => Promise<
     QueryOrFunc extends FunctionReferenceLike<"query">
-      ? ReferenceSignature<QueryOrFunc>["result"]
+      ? FunctionReturnType<QueryOrFunc>
       : QueryOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
         : never
@@ -2725,11 +2704,11 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   >(
     mutationOrFunc: MutationOrFunc,
     ...args: MutationOrFunc extends FunctionReferenceLike<"mutation">
-      ? ReferenceArgs<MutationOrFunc>
+      ? OptionalRestArgs<MutationOrFunc>
       : []
   ) => Promise<
     MutationOrFunc extends FunctionReferenceLike<"mutation">
-      ? ReferenceSignature<MutationOrFunc>["result"]
+      ? FunctionReturnType<MutationOrFunc>
       : MutationOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
         : never
@@ -2751,11 +2730,11 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   >(
     actionOrFunc: ActionOrFunc,
     ...args: ActionOrFunc extends FunctionReferenceLike<"action">
-      ? ReferenceArgs<ActionOrFunc>
+      ? OptionalRestArgs<ActionOrFunc>
       : []
   ) => Promise<
     ActionOrFunc extends FunctionReferenceLike<"action">
-      ? ReferenceSignature<ActionOrFunc>["result"]
+      ? FunctionReturnType<ActionOrFunc>
       : ActionOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
         : never
