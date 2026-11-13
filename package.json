@@ -54,6 +54,6 @@
     "prettier": "3.9.10",
     "replace-in-file": "9.0.0",
     "typescript": "5.9.3",
-    "vitest": "1.6.1"
+    "vitest": "3.2.6"
   }
 }
