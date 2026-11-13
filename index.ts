@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { version } from "convex";
 import {
   ActionBuilder,
   ApiFromModules,
@@ -9,7 +10,6 @@ import {
   DocumentByName,
   FilterApi,
   FunctionReference,
-  FunctionReturnType,
   GenericActionCtx,
   GenericDataModel,
   GenericDocument,
@@ -18,7 +18,6 @@ import {
   GenericSchema,
   HttpRouter,
   MutationBuilder,
-  OptionalRestArgs,
   PublicHttpAction,
   QueryBuilder,
   RegisteredAction,
@@ -179,6 +178,7 @@ class NestedLock {
 
 const nestedTxStorage = new AsyncLocalStorage<NestedLock>();
 const authStorage = new AsyncLocalStorage<AuthFake>();
+const scheduledMutationStorage = new AsyncLocalStorage<string | undefined>();
 const convexGlobalStorage = new AsyncLocalStorage<ConvexGlobal>();
 
 class DatabaseFake {
@@ -1875,7 +1875,11 @@ async function runScheduledFunction({
         return;
       }
       try {
-        await withAuth().fun(functionPath, args);
+        const { func } = await resolveFunction(functionPath, "any");
+        await scheduledMutationStorage.run(
+          func.isMutation ? jobId : undefined,
+          () => withAuth().fun(functionPath, args),
+        );
       } catch (error) {
         console.error(`Error when running scheduled function ${name}`, error);
         await withAuth().runInComponent(componentPath, async () => {
@@ -1888,6 +1892,9 @@ async function runScheduledFunction({
       }
       await withAuth().runInComponent(componentPath, async () => {
         const job = db.get("_scheduled_functions", jobId) as ScheduledFunction;
+        if (job.state.kind === "canceled") {
+          return;
+        }
         if (job.state.kind !== "inProgress") {
           throw new Error(
             `\`convexTest\` invariant error: Unexpected scheduled function state after it finished running: ${job.state.kind}`,
@@ -2234,6 +2241,25 @@ function asyncSyscallImpl() {
       }
       case "1.0/cancel_job": {
         const { id } = args;
+        if (scheduledMutationStorage.getStore() === id) {
+          // The backend gates this on the function's installed Convex version.
+          const [release, prerelease] = version.split("+")[0].split("-");
+          const [major, minor, patch] = release.split(".").map(Number);
+          if (
+            major > 1 ||
+            (major === 1 &&
+              (minor > 50 ||
+                (minor === 50 && (patch > 0 || (patch === 0 && !prerelease)))))
+          ) {
+            throw new Error(
+              "ScheduledFunctionCancelingItself: A mutation cannot cancel itself",
+            );
+          }
+          console.warn(
+            "A scheduled mutation canceling itself is deprecated and will throw an error in a future version of Convex.",
+          );
+          return JSON.stringify(null);
+        }
         db.patch("_scheduled_functions", id, { state: { kind: "canceled" } });
         return JSON.stringify({});
       }
@@ -2328,6 +2354,35 @@ function asyncSyscallImpl() {
       }
       case "1.0/auditLog": {
         return JSON.stringify(null);
+      }
+      case "1.0/createServiceToken":
+      case "1.0/getServiceUrl": {
+        const udfType = executionContextStorage.getStore()?.udfType;
+        if (udfType !== "action" && udfType !== "http") {
+          throw new Error(`Unknown async operation ${op}`);
+        }
+        const { service } = args;
+        if (service !== "ai-gateway") {
+          throw new Error(`Unsupported Convex service: ${String(service)}`);
+        }
+        if (op === "1.0/getServiceUrl") {
+          return JSON.stringify("https://ai-gateway.convex.test");
+        }
+        // An unsecured, short-lived test credential cannot authenticate to a
+        // real service. The reserved .test URL above avoids production endpoints.
+        const iat = Math.floor(Date.now() / 1000);
+        const header = base64UrlEncode(
+          JSON.stringify({ alg: "none", typ: "JWT" }),
+        );
+        const payload = base64UrlEncode(
+          JSON.stringify({
+            iss: "convex-test",
+            aud: service,
+            iat,
+            exp: iat + 300,
+          }),
+        );
+        return JSON.stringify(`${header}.${payload}.`);
       }
       case "1.0/signJwt": {
         // Signing reads the current time, which query caching could serve
@@ -2607,6 +2662,33 @@ export function defineTestApp<
   };
 }
 
+// Structural compatibility keeps declarations usable with Convex 1.43,
+// which does not export FunctionReference_future or its signature helpers.
+type FunctionReferenceLike<Type extends "query" | "mutation" | "action"> =
+  | FunctionReference<Type, any>
+  | {
+      _type: Type;
+      _visibility: "public" | "internal";
+      _componentPath: string | undefined;
+      _fn?: ((args: any, keys: never) => any) | undefined;
+    };
+
+type ReferenceSignature<Ref> = Ref extends {
+  _args: infer Args;
+  _returnType: infer Result;
+}
+  ? { args: Args; result: Result }
+  : Ref extends {
+        _fn?: ((args: infer Args, keys: never) => infer Result) | undefined;
+      }
+    ? { args: Args; result: Result }
+    : never;
+
+type ReferenceArgs<Ref> =
+  ReferenceSignature<Ref>["args"] extends Record<string, never>
+    ? [args?: Record<string, never>]
+    : [args: ReferenceSignature<Ref>["args"]];
+
 export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   /**
    * Call a public or internal query, or run an inline query function.
@@ -2619,16 +2701,16 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
    */
   query: <
     QueryOrFunc extends
-      | FunctionReference<"query", any>
+      | FunctionReferenceLike<"query">
       | ((ctx: GenericQueryCtx<DataModel>) => Promise<any>),
   >(
     queryOrFunc: QueryOrFunc,
-    ...args: QueryOrFunc extends FunctionReference<"query", any>
-      ? OptionalRestArgs<QueryOrFunc>
+    ...args: QueryOrFunc extends FunctionReferenceLike<"query">
+      ? ReferenceArgs<QueryOrFunc>
       : []
   ) => Promise<
-    QueryOrFunc extends FunctionReference<"query", any>
-      ? FunctionReturnType<QueryOrFunc>
+    QueryOrFunc extends FunctionReferenceLike<"query">
+      ? ReferenceSignature<QueryOrFunc>["result"]
       : QueryOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
         : never
@@ -2645,16 +2727,16 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
    */
   mutation: <
     MutationOrFunc extends
-      | FunctionReference<"mutation", any>
+      | FunctionReferenceLike<"mutation">
       | ((ctx: GenericMutationCtx<DataModel>) => Promise<any>),
   >(
     mutationOrFunc: MutationOrFunc,
-    ...args: MutationOrFunc extends FunctionReference<"mutation", any>
-      ? OptionalRestArgs<MutationOrFunc>
+    ...args: MutationOrFunc extends FunctionReferenceLike<"mutation">
+      ? ReferenceArgs<MutationOrFunc>
       : []
   ) => Promise<
-    MutationOrFunc extends FunctionReference<"mutation", any>
-      ? FunctionReturnType<MutationOrFunc>
+    MutationOrFunc extends FunctionReferenceLike<"mutation">
+      ? ReferenceSignature<MutationOrFunc>["result"]
       : MutationOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
         : never
@@ -2671,16 +2753,16 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
    */
   action: <
     ActionOrFunc extends
-      | FunctionReference<"action", any>
+      | FunctionReferenceLike<"action">
       | ((ctx: GenericActionCtx<DataModel>) => Promise<any>),
   >(
     actionOrFunc: ActionOrFunc,
-    ...args: ActionOrFunc extends FunctionReference<"action", any>
-      ? OptionalRestArgs<ActionOrFunc>
+    ...args: ActionOrFunc extends FunctionReferenceLike<"action">
+      ? ReferenceArgs<ActionOrFunc>
       : []
   ) => Promise<
-    ActionOrFunc extends FunctionReference<"action", any>
-      ? FunctionReturnType<ActionOrFunc>
+    ActionOrFunc extends FunctionReferenceLike<"action">
+      ? ReferenceSignature<ActionOrFunc>["result"]
       : ActionOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
         : never
