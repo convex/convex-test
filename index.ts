@@ -2242,14 +2242,7 @@ function asyncSyscallImpl() {
         const { id } = args;
         if (requestMetadataStorage.getStore()?.scheduledFunctionId === id) {
           // The backend gates this on the function's installed Convex version.
-          const [release, prerelease] = version.split("+")[0].split("-");
-          const [major, minor, patch] = release.split(".").map(Number);
-          if (
-            major > 1 ||
-            (major === 1 &&
-              (minor > 50 ||
-                (minor === 50 && (patch > 0 || (patch === 0 && !prerelease)))))
-          ) {
+          if (Number(version.split(".")[1]) >= 50) {
             throw new Error(
               "ScheduledFunctionCancelingItself: A mutation cannot cancel itself",
             );

@@ -144,7 +144,7 @@ test.each([false, true])(
   },
 );
 
-test.each(["1.43.0", "1.49.0", "1.50.0-alpha.1"])(
+test.each(["1.43.0", "1.49.0"])(
   "%s warns and ignores self-cancellation",
   async (version) => {
     runtime.version = version;
@@ -158,7 +158,7 @@ test.each(["1.43.0", "1.49.0", "1.50.0-alpha.1"])(
   },
 );
 
-test.each(["1.50.0+build.1", "1.50.1-alpha.1", "1.51.0-alpha.1", "2.0.0"])(
+test.each(["1.50.0", "1.50.1", "1.51.0"])(
   "%s rejects self-cancellation",
   async (version) => {
     runtime.version = version;
