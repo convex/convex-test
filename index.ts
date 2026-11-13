@@ -1849,6 +1849,7 @@ async function runScheduledFunction({
     userAgent: null,
     requestId: newRequestId(),
     scheduledFunctionId: jobId,
+    scheduledFunctionComponentPath: componentPath,
     authToken: null,
   };
   await requestMetadataStorage.run(requestMetadata, () =>
@@ -2042,7 +2043,17 @@ function asyncSyscallImpl() {
               "or HTTP action. It is not available in queries.",
           );
         }
-        return JSON.stringify(convexToJson(requestMetadata));
+        const { ip, userAgent, requestId, scheduledFunctionId, authToken } =
+          requestMetadata;
+        return JSON.stringify(
+          convexToJson({
+            ip,
+            userAgent,
+            requestId,
+            scheduledFunctionId,
+            authToken,
+          }),
+        );
       }
       case "1.0/getDeploymentMetadata": {
         return JSON.stringify(
@@ -2174,12 +2185,29 @@ function asyncSyscallImpl() {
 
         tracker?.trackScheduledFunction(getConvexSize(parsedArgs));
 
+        const metadata = requestMetadataStorage.getStore();
+        // IDs can collide between component databases, so look up the parent
+        // in the component that owns its scheduled-function document.
+        const parentJob =
+          metadata?.scheduledFunctionId &&
+          metadata.scheduledFunctionComponentPath !== undefined
+            ? (getDbForComponent(metadata.scheduledFunctionComponentPath).get(
+                "_scheduled_functions",
+                metadata.scheduledFunctionId,
+              ) as ScheduledFunction | null)
+            : null;
+        const canceled = parentJob?.state.kind === "canceled";
+        const scheduledTime = canceled ? Date.now() : tsInSecs * 1000;
         const jobId = db.insert("_scheduled_functions", {
           args: [parsedArgs],
           name: functionPath.udfPath,
-          scheduledTime: tsInSecs * 1000,
-          state: { kind: "pending" },
+          scheduledTime,
+          state: { kind: canceled ? "canceled" : "pending" },
+          ...(canceled ? { completedTime: scheduledTime } : {}),
         });
+        if (canceled) {
+          return JSON.stringify(convexToJson(jobId));
+        }
         const componentPath = getCurrentComponentPath();
         // Capture the current test's ConvexGlobal so the scheduled
         // function callback (which runs via setTimeout, outside the
@@ -2218,10 +2246,8 @@ function asyncSyscallImpl() {
         return JSON.stringify(convexToJson(jobId));
       }
       case "1.0/actions/cancel_job": {
-        // TODO: Match the remaining backend cancellation semantics: tasks
-        // scheduled after cancellation, including through nested calls, should
-        // start canceled. A canceled action should stay canceled if it later
-        // throws, and canceling a terminal job should leave its state unchanged.
+        // TODO: A canceled action should stay canceled if it later throws,
+        // and canceling a terminal job should leave its state unchanged.
         await withAuth().run(async () => {
           // Actions may cancel their own job; only mutation cancellation
           // checks the scheduled request ID.
@@ -3045,7 +3071,10 @@ type RequestMetadataFake = {
   ip: string | null;
   userAgent: string | null;
   requestId: string;
-  scheduledFunctionId: string | null;
+  scheduledFunctionId: GenericId<"_scheduled_functions"> | null;
+  // Internal ownership for component-scoped job lookups; excluded from the
+  // public request metadata returned by the syscall.
+  scheduledFunctionComponentPath?: string;
   authToken: string | null;
 };
 
