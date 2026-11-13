@@ -158,7 +158,7 @@ test.each(["1.43.0", "1.49.0"])(
   },
 );
 
-test.each(["1.50.0", "1.50.1", "1.51.0"])(
+test.each(["1.50.0", "1.50.1", "1.51.0", "2.0.0", "2.1.0"])(
   "%s rejects self-cancellation",
   async (version) => {
     runtime.version = version;
