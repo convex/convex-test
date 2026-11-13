@@ -16,7 +16,7 @@ export const sign = mutation({
   args: { claims: v.optional(v.any()), expiresInSeconds: v.number() },
   returns: v.string(),
   handler: async (ctx, args) => {
-    return await ctx.auth.signJwt(args);
+    return await ctx.auth.signJwt({ ...args, claims: args.claims });
   },
 });
 

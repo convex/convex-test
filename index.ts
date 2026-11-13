@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { version } from "convex";
 import {
   ActionBuilder,
   ApiFromModules,
@@ -9,6 +10,7 @@ import {
   DocumentByName,
   FilterApi,
   FunctionReference,
+  FunctionReference_future,
   FunctionReturnType,
   GenericActionCtx,
   GenericDataModel,
@@ -1888,6 +1890,9 @@ async function runScheduledFunction({
       }
       await withAuth().runInComponent(componentPath, async () => {
         const job = db.get("_scheduled_functions", jobId) as ScheduledFunction;
+        if (job.state.kind === "canceled") {
+          return;
+        }
         if (job.state.kind !== "inProgress") {
           throw new Error(
             `\`convexTest\` invariant error: Unexpected scheduled function state after it finished running: ${job.state.kind}`,
@@ -2213,8 +2218,16 @@ function asyncSyscallImpl() {
         return JSON.stringify(convexToJson(jobId));
       }
       case "1.0/actions/cancel_job": {
+        // TODO: Match the remaining backend cancellation semantics: tasks
+        // scheduled after cancellation, including through nested calls, should
+        // start canceled. A canceled action should stay canceled if it later
+        // throws, and canceling a terminal job should leave its state unchanged.
         await withAuth().run(async () => {
-          await getSyscalls().asyncSyscall("1.0/cancel_job", jsonArgs);
+          // Actions may cancel their own job; only mutation cancellation
+          // checks the scheduled request ID.
+          db.patch("_scheduled_functions", args.id, {
+            state: { kind: "canceled" },
+          });
         });
         return JSON.stringify({});
       }
@@ -2234,6 +2247,19 @@ function asyncSyscallImpl() {
       }
       case "1.0/cancel_job": {
         const { id } = args;
+        if (requestMetadataStorage.getStore()?.scheduledFunctionId === id) {
+          // The backend gates this on the function's installed Convex version.
+          const [major, minor] = version.split(".").map(Number);
+          if (major > 1 || (major === 1 && minor >= 50)) {
+            throw new Error(
+              "ScheduledFunctionCancelingItself: A mutation cannot cancel itself",
+            );
+          }
+          console.warn(
+            "A scheduled mutation canceling itself is deprecated and will throw an error in a future version of Convex.",
+          );
+          return JSON.stringify(null);
+        }
         db.patch("_scheduled_functions", id, { state: { kind: "canceled" } });
         return JSON.stringify({});
       }
@@ -2328,6 +2354,35 @@ function asyncSyscallImpl() {
       }
       case "1.0/auditLog": {
         return JSON.stringify(null);
+      }
+      case "1.0/createServiceToken":
+      case "1.0/getServiceUrl": {
+        const udfType = executionContextStorage.getStore()?.udfType;
+        if (udfType !== "action" && udfType !== "http") {
+          throw new Error(`Unknown async operation ${op}`);
+        }
+        const { service } = args;
+        if (service !== "ai-gateway") {
+          throw new Error(`Unsupported Convex service: ${String(service)}`);
+        }
+        if (op === "1.0/getServiceUrl") {
+          return JSON.stringify("https://ai-gateway.convex.test");
+        }
+        // An unsecured, short-lived test credential cannot authenticate to a
+        // real service. The reserved .test URL above avoids production endpoints.
+        const iat = Math.floor(Date.now() / 1000);
+        const header = base64UrlEncode(
+          JSON.stringify({ alg: "none", typ: "JWT" }),
+        );
+        const payload = base64UrlEncode(
+          JSON.stringify({
+            iss: "convex-test",
+            aud: service,
+            iat,
+            exp: iat + 300,
+          }),
+        );
+        return JSON.stringify(`${header}.${payload}.`);
       }
       case "1.0/signJwt": {
         // Signing reads the current time, which query caching could serve
@@ -2620,14 +2675,17 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   query: <
     QueryOrFunc extends
       | FunctionReference<"query", any>
+      | FunctionReference_future<"query", any>
       | ((ctx: GenericQueryCtx<DataModel>) => Promise<any>),
   >(
     queryOrFunc: QueryOrFunc,
-    ...args: QueryOrFunc extends FunctionReference<"query", any>
+    ...args: QueryOrFunc extends
+      FunctionReference<"query", any> | FunctionReference_future<"query", any>
       ? OptionalRestArgs<QueryOrFunc>
       : []
   ) => Promise<
-    QueryOrFunc extends FunctionReference<"query", any>
+    QueryOrFunc extends
+      FunctionReference<"query", any> | FunctionReference_future<"query", any>
       ? FunctionReturnType<QueryOrFunc>
       : QueryOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
@@ -2646,14 +2704,19 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   mutation: <
     MutationOrFunc extends
       | FunctionReference<"mutation", any>
+      | FunctionReference_future<"mutation", any>
       | ((ctx: GenericMutationCtx<DataModel>) => Promise<any>),
   >(
     mutationOrFunc: MutationOrFunc,
-    ...args: MutationOrFunc extends FunctionReference<"mutation", any>
+    ...args: MutationOrFunc extends
+      | FunctionReference<"mutation", any>
+      | FunctionReference_future<"mutation", any>
       ? OptionalRestArgs<MutationOrFunc>
       : []
   ) => Promise<
-    MutationOrFunc extends FunctionReference<"mutation", any>
+    MutationOrFunc extends
+      | FunctionReference<"mutation", any>
+      | FunctionReference_future<"mutation", any>
       ? FunctionReturnType<MutationOrFunc>
       : MutationOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
@@ -2672,14 +2735,17 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   action: <
     ActionOrFunc extends
       | FunctionReference<"action", any>
+      | FunctionReference_future<"action", any>
       | ((ctx: GenericActionCtx<DataModel>) => Promise<any>),
   >(
     actionOrFunc: ActionOrFunc,
-    ...args: ActionOrFunc extends FunctionReference<"action", any>
+    ...args: ActionOrFunc extends
+      FunctionReference<"action", any> | FunctionReference_future<"action", any>
       ? OptionalRestArgs<ActionOrFunc>
       : []
   ) => Promise<
-    ActionOrFunc extends FunctionReference<"action", any>
+    ActionOrFunc extends
+      FunctionReference<"action", any> | FunctionReference_future<"action", any>
       ? FunctionReturnType<ActionOrFunc>
       : ActionOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
