@@ -2218,6 +2218,10 @@ function asyncSyscallImpl() {
         return JSON.stringify(convexToJson(jobId));
       }
       case "1.0/actions/cancel_job": {
+        // TODO: Match the remaining backend cancellation semantics: tasks
+        // scheduled after cancellation, including through nested calls, should
+        // start canceled. A canceled action should stay canceled if it later
+        // throws, and canceling a terminal job should leave its state unchanged.
         await withAuth().run(async () => {
           // Actions may cancel their own job; only mutation cancellation
           // checks the scheduled request ID.
@@ -2658,9 +2662,6 @@ export function defineTestApp<
   };
 }
 
-type FunctionReferenceLike<Type extends "query" | "mutation" | "action"> =
-  FunctionReference<Type, any> | FunctionReference_future<Type, any>;
-
 export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
   /**
    * Call a public or internal query, or run an inline query function.
@@ -2673,15 +2674,18 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
    */
   query: <
     QueryOrFunc extends
-      | FunctionReferenceLike<"query">
+      | FunctionReference<"query", any>
+      | FunctionReference_future<"query", any>
       | ((ctx: GenericQueryCtx<DataModel>) => Promise<any>),
   >(
     queryOrFunc: QueryOrFunc,
-    ...args: QueryOrFunc extends FunctionReferenceLike<"query">
+    ...args: QueryOrFunc extends
+      FunctionReference<"query", any> | FunctionReference_future<"query", any>
       ? OptionalRestArgs<QueryOrFunc>
       : []
   ) => Promise<
-    QueryOrFunc extends FunctionReferenceLike<"query">
+    QueryOrFunc extends
+      FunctionReference<"query", any> | FunctionReference_future<"query", any>
       ? FunctionReturnType<QueryOrFunc>
       : QueryOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
@@ -2699,15 +2703,20 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
    */
   mutation: <
     MutationOrFunc extends
-      | FunctionReferenceLike<"mutation">
+      | FunctionReference<"mutation", any>
+      | FunctionReference_future<"mutation", any>
       | ((ctx: GenericMutationCtx<DataModel>) => Promise<any>),
   >(
     mutationOrFunc: MutationOrFunc,
-    ...args: MutationOrFunc extends FunctionReferenceLike<"mutation">
+    ...args: MutationOrFunc extends
+      | FunctionReference<"mutation", any>
+      | FunctionReference_future<"mutation", any>
       ? OptionalRestArgs<MutationOrFunc>
       : []
   ) => Promise<
-    MutationOrFunc extends FunctionReferenceLike<"mutation">
+    MutationOrFunc extends
+      | FunctionReference<"mutation", any>
+      | FunctionReference_future<"mutation", any>
       ? FunctionReturnType<MutationOrFunc>
       : MutationOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
@@ -2725,15 +2734,18 @@ export type TestConvexForDataModel<DataModel extends GenericDataModel> = {
    */
   action: <
     ActionOrFunc extends
-      | FunctionReferenceLike<"action">
+      | FunctionReference<"action", any>
+      | FunctionReference_future<"action", any>
       | ((ctx: GenericActionCtx<DataModel>) => Promise<any>),
   >(
     actionOrFunc: ActionOrFunc,
-    ...args: ActionOrFunc extends FunctionReferenceLike<"action">
+    ...args: ActionOrFunc extends
+      FunctionReference<"action", any> | FunctionReference_future<"action", any>
       ? OptionalRestArgs<ActionOrFunc>
       : []
   ) => Promise<
-    ActionOrFunc extends FunctionReferenceLike<"action">
+    ActionOrFunc extends
+      FunctionReference<"action", any> | FunctionReference_future<"action", any>
       ? FunctionReturnType<ActionOrFunc>
       : ActionOrFunc extends (ctx: any) => Promise<infer Output>
         ? Output
