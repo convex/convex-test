@@ -1849,7 +1849,7 @@ async function runScheduledFunction({
     userAgent: null,
     requestId: newRequestId(),
     scheduledFunctionId: jobId,
-    scheduledFunctionComponentPath: componentPath,
+    _scheduledFunctionComponentPath: componentPath,
     authToken: null,
   };
   await requestMetadataStorage.run(requestMetadata, () =>
@@ -2190,8 +2190,8 @@ function asyncSyscallImpl() {
         // in the component that owns its scheduled-function document.
         const parentJob =
           metadata?.scheduledFunctionId &&
-          metadata.scheduledFunctionComponentPath !== undefined
-            ? (getDbForComponent(metadata.scheduledFunctionComponentPath).get(
+          metadata._scheduledFunctionComponentPath !== undefined
+            ? (getDbForComponent(metadata._scheduledFunctionComponentPath).get(
                 "_scheduled_functions",
                 metadata.scheduledFunctionId,
               ) as ScheduledFunction | null)
@@ -3074,7 +3074,7 @@ type RequestMetadataFake = {
   scheduledFunctionId: GenericId<"_scheduled_functions"> | null;
   // Internal ownership for component-scoped job lookups; excluded from the
   // public request metadata returned by the syscall.
-  scheduledFunctionComponentPath?: string;
+  _scheduledFunctionComponentPath?: string;
   authToken: string | null;
 };
 
