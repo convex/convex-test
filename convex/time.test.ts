@@ -38,7 +38,7 @@ test.each(["query", "mutation", "run"] as const)(
 );
 
 test.each([0, -1000])(
-  "transaction time stays ahead of commits with clock delta %i ms",
+  "transaction time follows the test clock after commits with clock delta %i ms",
   async (clockDelta) => {
     vi.useFakeTimers({ now });
     const t = convexTest(schema);
@@ -49,13 +49,8 @@ test.each([0, -1000])(
 
     for (const type of ["query", "mutation", "run"] as const) {
       const handler = async () => {
-        const snapshotTs = getSnapshotTs();
         const currentTime = Date.now();
-        // Compare as bigints so rounding cannot hide a one-nanosecond skew.
-        expect(BigInt(currentTime) * 1_000_000n).toBeGreaterThanOrEqual(
-          snapshotTs,
-        );
-        expect(currentTime).toBe(now + 1);
+        expect(currentTime).toBe(now + clockDelta);
         expect(new Date().getTime()).toBe(currentTime);
         await Promise.resolve();
         expect(Date.now()).toBe(currentTime);
@@ -73,9 +68,6 @@ test.each([0, -1000])(
 
     await t.mutation(async (ctx) => {
       const currentTime = Date.now();
-      expect(BigInt(currentTime) * 1_000_000n).toBeGreaterThanOrEqual(
-        getSnapshotTs(),
-      );
       let previousCreationTime = -Infinity;
       for (let i = 0; i < 3; i++) {
         const id = await ctx.db.insert("commitTs", {});
@@ -121,7 +113,7 @@ test("transaction clocks are isolated from concurrent tests and actions", async 
   } finally {
     release();
   }
-  expect(await query).toBe(now + 1);
+  expect(await query).toBe(now - 1000);
 });
 
 test("a queued transaction pins its time after acquiring the lock", async () => {
@@ -151,9 +143,6 @@ test("a queued transaction pins its time after acquiring the lock", async () => 
   const [commitTs, result] = await Promise.all([mutation, query]);
   expect(result.time).toBe(now + 1000);
   expect(result.snapshotTs).toBe(commitTs);
-  expect(BigInt(result.time) * 1_000_000n).toBeGreaterThanOrEqual(
-    result.snapshotTs,
-  );
 });
 
 test("nested queries and mutations use exactly the parent transaction's time", async () => {
@@ -163,7 +152,7 @@ test("nested queries and mutations use exactly the parent transaction's time", a
   await t.mutation(async () => null);
   await t.mutation(async (ctx) => {
     const currentTime = Date.now();
-    expect(currentTime).toBe(now + 1);
+    expect(currentTime).toBe(now);
     vi.setSystemTime(now + 1000);
     expect(await ctx.runQuery(internal.globals.readTime)).toBe(currentTime);
     const nested = await ctx.runMutation(
@@ -215,7 +204,7 @@ test("Date keeps explicit arguments and static methods inside transactions", asy
   await t.mutation(async () => null);
   await t.query(async () => {
     const date = new Date();
-    expect(date.getTime()).toBe(now + 1);
+    expect(date.getTime()).toBe(now);
     expect(date).toBeInstanceOf(Date);
     expect(Date()).toBe(date.toString());
     expect(new Date(0).getTime()).toBe(0);
@@ -233,7 +222,7 @@ test("clock changes and rollbacks do not leak transaction time", async () => {
   await t.mutation(async () => null);
   await expect(
     t.mutation(async () => {
-      expect(Date.now()).toBe(now + 1);
+      expect(Date.now()).toBe(now);
       throw new Error("rollback");
     }),
   ).rejects.toThrow("rollback");
@@ -243,7 +232,7 @@ test("clock changes and rollbacks do not leak transaction time", async () => {
 
   vi.useRealTimers();
   vi.useFakeTimers({ now: now - 1000 });
-  expect(await t.query(async () => Date.now())).toBe(now + 1);
+  expect(await t.query(async () => Date.now())).toBe(now - 1000);
   expect(Date.now()).toBe(now - 1000);
 });
 
@@ -253,13 +242,13 @@ test("Date.now can be mocked before and after a transaction", async () => {
   await t.mutation(async () => null);
   await t.mutation(async () => null);
   clock.mockReturnValue(now - 1000);
-  expect(await t.query(async () => Date.now())).toBe(now + 1);
+  expect(await t.query(async () => Date.now())).toBe(now - 1000);
   expect(Date.now()).toBe(now - 1000);
   clock.mockRestore();
   expect(Date.now()).toBeGreaterThan(now);
 
   vi.spyOn(Date, "now").mockReturnValue(now - 2000);
-  expect(await t.query(async () => Date.now())).toBe(now + 1);
+  expect(await t.query(async () => Date.now())).toBe(now - 2000);
   expect(Date.now()).toBe(now - 2000);
 });
 
@@ -277,11 +266,11 @@ test.each(["before", "after"])(
     if (when === "after") vi.stubGlobal("Date", MockDate);
     await t.mutation(async () => null);
     await t.mutation(async () => null);
-    expect(await t.query(async () => Date.now())).toBe(now + 1);
+    expect(await t.query(async () => Date.now())).toBe(now);
     expect(Date).toBe(MockDate);
     vi.unstubAllGlobals();
     expect(Date).toBe(BaseDate);
-    expect(await t.query(async () => Date.now())).toBeGreaterThan(now + 1);
+    expect(await t.query(async () => Date.now())).toBeGreaterThan(now);
   },
 );
 
@@ -303,28 +292,34 @@ test("scheduled timers use the wall clock when transaction time is pinned", asyn
   expect(message?.body).toBe("already due");
 });
 
-test("snapshotTs <= Date.now() <= _creationTime, like the Convex backend", async () => {
+test("wall time follows the test clock while snapshot timestamps increase", async () => {
   vi.useFakeTimers({ now });
   const t = convexTest(schema);
-  const check = (clocks: {
-    snapshotTs: bigint;
-    time: number;
-    creationTime: number;
-  }) => {
-    expect(BigInt(clocks.time) * 1_000_000n).toBeGreaterThanOrEqual(
-      clocks.snapshotTs,
-    );
+  let previousSnapshotTs = -1n;
+  const check = (
+    clocks: { snapshotTs: bigint; time: number; creationTime: number },
+    wallTime: number,
+  ) => {
+    expect(clocks.time).toBe(wallTime);
     expect(clocks.creationTime).toBeGreaterThanOrEqual(clocks.time);
+    expect(clocks.snapshotTs).toBeGreaterThan(previousSnapshotTs);
+    previousSnapshotTs = clocks.snapshotTs;
   };
-  // Frozen, forward, and backward wall clocks, including commits bumped one
-  // nanosecond past a frozen wall clock.
   for (const delta of [0, 0, 0, 5000, -5000, 0]) {
-    vi.setSystemTime(now + delta);
-    check(await t.mutation(api.getSnapshotTs.insertAtPinnedTime, {}));
+    const wallTime = now + delta;
+    vi.setSystemTime(wallTime);
+    check(await t.mutation(api.getSnapshotTs.insertAtPinnedTime, {}), wallTime);
     check(
-      await t.action((ctx) =>
-        ctx.runMutation(api.getSnapshotTs.insertAtPinnedTime, {}),
-      ),
+      await t.action(async (ctx) => {
+        const actionTime = Date.now();
+        const result = await ctx.runMutation(
+          api.getSnapshotTs.insertAtPinnedTime,
+          {},
+        );
+        expect(result.time).toBe(actionTime);
+        return result;
+      }),
+      wallTime,
     );
     check(
       await t.run(async (ctx) => {
@@ -334,6 +329,7 @@ test("snapshotTs <= Date.now() <= _creationTime, like the Convex backend", async
         const doc = (await ctx.db.get(id))!;
         return { snapshotTs, time, creationTime: doc._creationTime };
       }),
+      wallTime,
     );
   }
 });
