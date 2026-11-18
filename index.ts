@@ -598,6 +598,7 @@ class DatabaseFake {
     pageSize,
     maximumRowsRead,
     maximumBytesRead,
+    onRead,
   }: {
     query: SerializedQuery;
     cursor: string | null;
@@ -605,6 +606,7 @@ class DatabaseFake {
     pageSize: number;
     maximumRowsRead?: number | null;
     maximumBytesRead?: number | null;
+    onRead: (doc: GenericDocument) => void;
   }) {
     const { sortedDocs, filterFn, fieldPathsToSortBy, order } =
       this._resolveQuerySource(query);
@@ -672,6 +674,7 @@ class DatabaseFake {
         if (cmp >= 0) {
           // At or past end cursor — include this doc if exactly at cursor, then stop
           if (cmp === 0) {
+            onRead(doc);
             rowsRead += 1;
             readDocCursors.push(this._encodeCursor(doc, cursorFields));
             if (filterFn(doc)) {
@@ -683,16 +686,18 @@ class DatabaseFake {
         }
       }
 
+      onRead(doc);
       rowsRead += 1;
       bytesRead += getDocumentSize(doc);
       readDocCursors.push(this._encodeCursor(doc, cursorFields));
 
-      // Check bandwidth limits
+      // Like the backend, read the complete interval when an end cursor is
+      // supplied. Transaction limits still apply through onRead above.
       let hitLimit = false;
-      if (maximumRowsRead && rowsRead >= maximumRowsRead) {
+      if (!endCursor && maximumRowsRead && rowsRead >= maximumRowsRead) {
         hitLimit = true;
       }
-      if (maximumBytesRead && bytesRead >= maximumBytesRead) {
+      if (!endCursor && maximumBytesRead && bytesRead >= maximumBytesRead) {
         hitLimit = true;
       }
 
@@ -1952,6 +1957,7 @@ function asyncSyscallImpl() {
             );
           }
         }
+        tracker?.trackIndexRange();
         const { page, isDone, continueCursor, splitCursor, pageStatus } =
           db.paginate({
             query,
@@ -1960,13 +1966,9 @@ function asyncSyscallImpl() {
             pageSize,
             maximumRowsRead,
             maximumBytesRead,
+            // Charge every row entering the pipeline, before post-query filters.
+            onRead: (doc) => tracker?.trackRead(getDocumentSize(doc)),
           });
-        if (tracker) {
-          tracker.trackIndexRange();
-          for (const doc of page) {
-            tracker.trackRead(getDocumentSize(doc));
-          }
-        }
         return JSON.stringify(
           convexToJson({
             page,
