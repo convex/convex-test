@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.73
+
+### Patch Changes
+
+- d7317eb: Count documents rejected by pagination filters toward transaction read metrics and limits. Preserve the complete interval when an end cursor is supplied, while continuing to enforce transaction-wide limits. (#199)
+
 ## 0.0.72
 
 - Match version-dependent scheduled mutation self-cancellation: Convex 1.50+ throws and rolls back uncaught failures, while older versions warn and ignore the cancellation.
