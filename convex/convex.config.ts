@@ -6,13 +6,12 @@ import counter from "./counter/component/convex.config.js";
 const app = defineApp();
 const counterComponent = app.use(counter);
 app.use(counter, { name: "counter2" });
-// The `args` option is internal until component arguments are released.
 app.use(greeter, {
   args: {
     greeting: "Hello",
     onGreet: internal.componentInit.onGreet,
     counter: counterComponent,
   },
-} as any);
+});
 
 export default app;

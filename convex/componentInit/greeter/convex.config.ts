@@ -2,11 +2,9 @@ import { defineComponent } from "convex/server";
 import { api, internal } from "./_generated/api";
 import echo from "../echo/convex.config";
 
-// The `init` and `args` options are internal until component arguments are
-// released, so their types aren't public yet.
 const component = defineComponent("greeter", {
   init: internal.init.default,
-} as any) as any;
+});
 
 component.use(echo, {
   args: {
