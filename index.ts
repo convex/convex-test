@@ -2164,8 +2164,8 @@ function asyncSyscallImpl() {
         const functionPath = getFunctionPathFromAddress(functionAddress);
         // Load the component eagerly so a missing registration fails here.
         getComponentInfo(functionPath.componentPath);
-        // Like the real backend, check that the target exists when it is
-        // scheduled, not when the job runs.
+        // The backend rejects a missing target here, inside the scheduling
+        // transaction, so a bad target never becomes a job.
         await validateScheduledFunction(functionPath);
         // Convert args to a Convex value before storing them or passing them to the function
         const parsedArgs = jsonToConvex(fnArgs);
@@ -4450,8 +4450,9 @@ function parseFunctionHandle(handle: string) {
   return { componentPath, udfPath };
 }
 
-// Mirrors `validate_schedule_args` in the backend: the scheduled function
-// must exist when it is scheduled, even though it runs later.
+// Mirrors the backend's `validate_schedule_args`: the module must exist and
+// must export a Convex function under the scheduled name. Errors use the
+// backend's wording.
 async function validateScheduledFunction(functionPath: FunctionPath) {
   const [modulePath, maybeExportName] = functionPath.udfPath.split(":");
   const exportName =
