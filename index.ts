@@ -1785,10 +1785,11 @@ function validateDeploymentJwtAudience(claims: Record<string, any>) {
 // The app signs under the deployment's origin and a component under
 // `{origin}/components/{path}`.
 function deploymentJwtIssuer(componentPath: string) {
-  const origin = (
-    (typeof process !== "undefined" && process.env.CONVEX_CLOUD_URL) ||
-    DEFAULT_CONVEX_CLOUD_URL
-  ).replace(/\/+$/, "");
+  // Signing is allowed in inits, which can't read environment variables.
+  const cloudUrl = executionContextStorage.exit(
+    () => typeof process !== "undefined" && process.env.CONVEX_CLOUD_URL,
+  );
+  const origin = (cloudUrl || DEFAULT_CONVEX_CLOUD_URL).replace(/\/+$/, "");
   return componentPath === ROOT_COMPONENT_PATH
     ? origin
     : `${origin}/components/${componentPath}`;
@@ -2100,6 +2101,9 @@ function asyncSyscallImpl() {
           args: udfArgsJson,
           transactionLimits,
         } = args;
+        if (executionContextStorage.getStore()?.udfType === "init") {
+          throw new Error("Can't call another function from an init function.");
+        }
         const udfArgs = jsonToConvex(udfArgsJson);
         const functionPath = getFunctionPathFromAddress({
           name,
@@ -2405,7 +2409,7 @@ function asyncSyscallImpl() {
             "ctx.auth.signJwt() can't be called from a query. Call it from a mutation.",
           );
         }
-        if (udfType !== "mutation") {
+        if (udfType !== "mutation" && udfType !== "init") {
           throw new Error(`Unknown async operation ${op}`);
         }
         return JSON.stringify(await signDeploymentJwt(args));
@@ -2632,13 +2636,16 @@ export function defineTestApp<
 
     defineModules<Modules extends Record<string, object>>(modules: Modules) {
       const moduleMap = new Map(Object.entries(modules));
-      const loadModule = async (path: string) => {
-        const module = moduleMap.get(path);
-        if (module === undefined) {
-          throw new Error(`Could not find module for: "${path}"`);
-        }
-        return module;
-      };
+      const loadModule = moduleLoader(
+        async (path: string) => {
+          const module = moduleMap.get(path);
+          if (module === undefined) {
+            throw new Error(`Could not find module for: "${path}"`);
+          }
+          return module;
+        },
+        [...moduleMap.keys()],
+      );
       const fullApi = anyApi as unknown as ApiFromModules<Modules>;
       return {
         api: filterApi<typeof fullApi, FunctionReference<any, "public">>(
@@ -2915,7 +2922,24 @@ export type TestConvexRoot<DataModel extends GenericDataModel> = {
     componentPath: string,
     schema: SchemaDefinition<GenericSchema, boolean>,
     glob: Record<string, () => Promise<any>>,
+    options?: {
+      /**
+       * Arguments for the component's init, in place of the ones its parent's
+       * `convex.config` passes. Function references are resolved in the
+       * parent, as `app.use(component, { args })` does.
+       */
+      args?: Record<string, unknown>;
+    },
   ) => ComponentApi;
+
+  /**
+   * Run the init of every registered component, as each push does.
+   *
+   * Inits of newly registered components also run before the next function
+   * call, so call this only to run them again (inits must be idempotent) or
+   * to check how one fails.
+   */
+  runInits: () => Promise<void>;
 } & TestConvexForDataModel<DataModel>;
 
 /**
@@ -2997,13 +3021,29 @@ function moduleCache(specifiedModules?: Record<string, () => Promise<any>>) {
       module,
     ]),
   );
-  return async (path: string) => {
+  const load = async (path: string) => {
     const module = modulesWithoutExtension[prefix + path];
     if (module === undefined) {
       throw new Error(`Could not find module for: "${path}"`);
     }
     return await module();
   };
+  const paths = Object.keys(modulesWithoutExtension)
+    .filter((path) => path.startsWith(prefix))
+    .map((path) => path.slice(prefix.length));
+  return moduleLoader(load, paths);
+}
+
+type ModuleLoader = ((path: string) => Promise<any>) & {
+  // Module paths relative to the modules root, without extensions.
+  paths: string[];
+};
+
+function moduleLoader(
+  load: (path: string) => Promise<any>,
+  paths: string[],
+): ModuleLoader {
+  return Object.assign(load, { paths });
 }
 
 function findModulesRoot(modulesPaths: string[], userProvidedModules: boolean) {
@@ -3038,7 +3078,9 @@ type FunctionPath = {
   udfPath: string;
 };
 
-type UdfType = "query" | "mutation" | "action" | "http";
+// "init" is a component's init: a mutation run by a push, which the runtime
+// restricts further (see `runMutationWithHandler`).
+type UdfType = "query" | "mutation" | "init" | "action" | "http";
 
 type ExecutionContext = {
   componentPath: string;
@@ -3090,6 +3132,12 @@ type ConvexGlobal = {
   jsSyscall: (op: string, args: any) => Promise<any>;
   // Generated on the first `ctx.auth.signJwt` call.
   deploymentJwtKey: Promise<DeploymentJwtKey> | null;
+  // Arguments for a component's init, by component path, that replace the
+  // ones its parent's `convex.config` passes.
+  componentArgs: Record<string, Record<string, unknown>>;
+  // Components registered since the last successful push, whose inits run
+  // before the next function call.
+  uninitializedComponents: Set<string>;
 };
 
 type DeploymentJwtKey = {
@@ -3592,6 +3640,9 @@ export function convexTest<Schema extends GenericSchema>(
  *     - `false` (default): limits are not enforced
  *     - `true` or `{}`: enforce default Convex limits
  *     - `{ bytesRead: 1024 }`: override specific limits
+ *   - `componentArgs`: Arguments for components' inits, keyed by component
+ *     path (e.g. `"counter"` or `"counter/nested"`), in place of the ones in
+ *     the parent's `convex.config`.
  *
  * Regardless of `transactionLimits`, a query may only call `.paginate()` once,
  * including nested query calls and component calls. Mutations may paginate
@@ -3609,6 +3660,7 @@ export function convexTest<Schema extends GenericSchema>(options: {
   /** For example `import.meta.glob("./**\/*.*s")` */
   modules?: Record<string, () => Promise<any>>;
   transactionLimits?: Partial<TransactionMetrics> | boolean;
+  componentArgs?: Record<string, Record<string, unknown>>;
 }): TestConvex<SchemaDefinition<Schema, boolean>>;
 export function convexTest<Schema extends GenericSchema>(
   schemaOrOptions?:
@@ -3617,11 +3669,13 @@ export function convexTest<Schema extends GenericSchema>(
         schema?: SchemaDefinition<Schema, boolean>;
         modules?: Record<string, () => Promise<any>>;
         transactionLimits?: Partial<TransactionMetrics> | boolean;
+        componentArgs?: Record<string, Record<string, unknown>>;
       },
   modules?: Record<string, () => Promise<any>>,
 ): TestConvex<SchemaDefinition<Schema, boolean>> {
   let schema: SchemaDefinition<Schema, boolean> | undefined = undefined;
   let limitsConfig: Partial<TransactionMetrics> | boolean = false;
+  let componentArgs: Record<string, Record<string, unknown>> = {};
 
   // Detect legacy API by checking for schema's "tables" property
   function isSchemaDefinition(
@@ -3646,15 +3700,22 @@ export function convexTest<Schema extends GenericSchema>(
     schema = opts.schema;
     modules = opts.modules;
     limitsConfig = opts.transactionLimits ?? false;
+    componentArgs = opts.componentArgs ?? {};
   }
 
-  return createConvexTest(schema, moduleCache(modules), limitsConfig);
+  return createConvexTest(
+    schema,
+    moduleCache(modules),
+    limitsConfig,
+    componentArgs,
+  );
 }
 
 function createConvexTest<SchemaDef extends SchemaDefinition<any, boolean>>(
   schema: SchemaDef | undefined,
   modules: ComponentInfo["modules"],
   limitsConfig: Partial<TransactionMetrics> | boolean,
+  componentArgs: Record<string, Record<string, unknown>> = {},
 ): TestConvex<SchemaDef> {
   const rootDb = new DatabaseFake(schema ?? null, ROOT_COMPONENT_PATH);
   const convexGlobal: ConvexGlobal = {
@@ -3670,7 +3731,10 @@ function createConvexTest<SchemaDef extends SchemaDefinition<any, boolean>>(
     asyncSyscall: asyncSyscallImpl(),
     jsSyscall: jsSyscallImpl(),
     deploymentJwtKey: null,
+    componentArgs: { ...componentArgs },
+    uninitializedComponents: new Set(),
   };
+  guardEnvironmentVariablesInInits();
   ensureGlobalProxy();
 
   // Wrap all function properties to run within this test's ALS context.
@@ -3681,31 +3745,74 @@ function createConvexTest<SchemaDef extends SchemaDefinition<any, boolean>>(
       result[key] =
         typeof val === "function"
           ? (...args: any[]) =>
-              convexGlobalStorage.run(convexGlobal, () => val(...args))
+              convexGlobalStorage.run(convexGlobal, async () => {
+                await initializeRegisteredComponents();
+                return await val(...args);
+              })
           : val;
     }
     return result;
+  }
+
+  // Concurrent calls share one run of the pending inits. A failed run leaves
+  // its components pending, like a push that was rolled back, so the next
+  // call runs their inits again.
+  let pendingInitRun: Promise<void> | null = null;
+  function initializeRegisteredComponents(): Promise<void> {
+    if (convexGlobal.uninitializedComponents.size === 0) {
+      return Promise.resolve();
+    }
+    pendingInitRun ??= (async () => {
+      const componentPaths = [...convexGlobal.uninitializedComponents];
+      try {
+        await runComponentInits(componentPaths);
+        for (const componentPath of componentPaths) {
+          convexGlobal.uninitializedComponents.delete(componentPath);
+        }
+      } finally {
+        pendingInitRun = null;
+      }
+    })();
+    return pendingInitRun;
   }
 
   function registerComponent<ComponentApi = unknown>(
     componentPath: string,
     schema: SchemaDefinition<GenericSchema, boolean>,
     glob: Record<string, () => Promise<any>>,
+    options?: { args?: Record<string, unknown> },
   ) {
     const componentInfo = {
       db: new DatabaseFake(schema, componentPath),
       modules: moduleCache(glob),
     };
     convexGlobal.components[componentPath] = componentInfo;
+    if (options?.args !== undefined) {
+      convexGlobal.componentArgs[componentPath] = options.args;
+    }
+    convexGlobal.uninitializedComponents.add(componentPath);
     return componentsGeneric()[componentPath] as unknown as ComponentApi;
+  }
+
+  async function runInits() {
+    await convexGlobalStorage.run(convexGlobal, async () => {
+      await pendingInitRun?.catch(() => {});
+      const componentPaths = Object.keys(convexGlobal.components).filter(
+        (componentPath) => componentPath !== ROOT_COMPONENT_PATH,
+      );
+      await runComponentInits(componentPaths);
+      convexGlobal.uninitializedComponents.clear();
+    });
   }
 
   // Each accessor is immutable: `withIdentity` and `withRequestMetadata`
   // return a new one, keeping what the other method configured, so they can be
   // called in either order.
   function testAccessor(auth: AuthFake, requestOptions: RequestOptions): any {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- Not part of the test API.
+    const { runInitMutations, ...functions } = withAuth(auth, requestOptions);
     return {
-      ...wrapInContext(withAuth(auth, requestOptions)),
+      ...wrapInContext(functions),
       jwks: () => convexGlobalStorage.run(convexGlobal, deploymentJwks),
       withIdentity(identity: Partial<UserIdentity>) {
         const subject =
@@ -3733,7 +3840,411 @@ function createConvexTest<SchemaDef extends SchemaDefinition<any, boolean>>(
   return {
     ...testAccessor(new AuthFake(), DEFAULT_REQUEST_OPTIONS),
     registerComponent,
+    runInits,
   };
+}
+
+// The backend's limits for a single init (`INIT_MAX_*` knobs). Inits can't
+// read or write files.
+const INIT_TRANSACTION_LIMITS: TransactionMetrics = {
+  bytesRead: 1 << 14,
+  bytesWritten: 1 << 14,
+  databaseQueries: 100,
+  documentsRead: 100,
+  documentsWritten: 100,
+  functionsScheduled: 10,
+  scheduledFunctionArgsBytes: 1 << 14,
+  filesWritten: 0,
+  fileWriteBytes: 0,
+  filesRead: 0,
+  fileReadBytes: 0,
+};
+
+type ComponentInitCall = {
+  componentPath: string;
+  resolved: Awaited<ReturnType<typeof resolveFunction<"mutation">>>;
+  args: Record<string, Value>;
+};
+
+/**
+ * Run the inits of `componentPaths` as a push does: resolve each component's
+ * arguments, then run every init in one transaction, each in its own nested
+ * transaction. Every init runs even if an earlier one fails, and then the
+ * whole transaction rolls back with an error listing each failure.
+ */
+async function runComponentInits(componentPaths: string[]) {
+  const resolvedArgs = new Map<string, Promise<Record<string, Value>>>();
+  const calls: ComponentInitCall[] = [];
+  // Parents first, like the backend's walk of the component tree.
+  const sorted = [...componentPaths].sort(
+    (a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b),
+  );
+  for (const componentPath of sorted) {
+    const definition = await loadComponentDefinition(componentPath);
+    const args = await componentInitArgs(componentPath, resolvedArgs);
+    const initPath: string | undefined = definition?._init;
+    if (initPath === undefined) {
+      if (Object.keys(args).length > 0) {
+        throw new Error(
+          `Component "${componentPath}" is passed arguments, but it doesn't declare an init. ` +
+            `Declare one with \`defineComponent(name, { init })\`.`,
+        );
+      }
+      continue;
+    }
+    calls.push({
+      componentPath,
+      resolved: await resolveInit(componentPath, initPath),
+      args,
+    });
+  }
+  for (const { componentPath, resolved, args } of calls) {
+    try {
+      validateFunctionArgs(
+        resolved.args,
+        args,
+        resolved.functionPath,
+        /* allowPendingValues */ false,
+      );
+    } catch (e) {
+      throw new Error(
+        `Invalid arguments for the init of component "${componentPath}": ${(e as Error).message}`,
+        { cause: e },
+      );
+    }
+  }
+  if (calls.length > 0) {
+    await withAuth(new AuthFake(), DEFAULT_REQUEST_OPTIONS).runInitMutations(
+      calls,
+    );
+  }
+}
+
+async function resolveInit(componentPath: string, initPath: string) {
+  const functionPath = { componentPath, udfPath: initPath };
+  let resolved;
+  try {
+    resolved = await resolveFunction(functionPath, "any");
+  } catch {
+    throw new Error(
+      `Component "${componentPath}" declares ${initPath} as its init, but that function doesn't exist.`,
+    );
+  }
+  if (!resolved.func.isMutation || !resolved.isInternal) {
+    throw new Error(
+      `Component "${componentPath}" declares ${initPath} as its init, but it isn't an ` +
+        `internal mutation. Define it with \`internalMutation\`.`,
+    );
+  }
+  return resolved;
+}
+
+function parentComponentPath(componentPath: string) {
+  const index = componentPath.lastIndexOf("/");
+  return index === -1 ? ROOT_COMPONENT_PATH : componentPath.slice(0, index);
+}
+
+/**
+ * The default export of a component's (or the app's) `convex.config`, if its
+ * modules include one: the object `defineComponent` or `defineApp` returned.
+ */
+async function loadComponentDefinition(componentPath: string): Promise<any> {
+  const component = getConvexGlobal().components[componentPath];
+  if (component === undefined || !component.modules.paths.includes(CONFIG)) {
+    return undefined;
+  }
+  return (await component.modules(CONFIG)).default;
+}
+
+const CONFIG = "convex.config";
+
+/**
+ * The arguments a component's init receives: the ones passed in
+ * `componentArgs` or `registerComponent`, or else the ones its parent's
+ * `convex.config` passes to `use()`, resolved in the parent.
+ */
+function componentInitArgs(
+  componentPath: string,
+  memo: Map<string, Promise<Record<string, Value>>>,
+): Promise<Record<string, Value>> {
+  if (componentPath === ROOT_COMPONENT_PATH) {
+    return Promise.resolve({});
+  }
+  let args = memo.get(componentPath);
+  if (args === undefined) {
+    args = (async () => {
+      const parentPath = parentComponentPath(componentPath);
+      const name = componentPath.slice(
+        parentPath === ROOT_COMPONENT_PATH ? 0 : parentPath.length + 1,
+      );
+      const parentRegistered =
+        getConvexGlobal().components[parentPath] !== undefined;
+      const parentArgs = parentRegistered
+        ? await componentInitArgs(parentPath, memo)
+        : null;
+      let rawArgs = getConvexGlobal().componentArgs[componentPath];
+      if (rawArgs === undefined) {
+        const parent = await loadComponentDefinition(parentPath);
+        const instantiation = (
+          parent?._childComponents as [string, unknown, unknown, unknown, any][]
+        )?.find(([childName]) => childName === name);
+        rawArgs = instantiation?.[4] ?? {};
+      }
+      const resolved: Record<string, Value> = {};
+      for (const [argName, arg] of Object.entries(rawArgs)) {
+        if (arg === undefined) {
+          continue;
+        }
+        try {
+          resolved[argName] = await resolveComponentArg(
+            arg,
+            parentPath,
+            parentArgs,
+          );
+        } catch (e) {
+          throw new Error(
+            `Invalid argument ${argName} for component '${componentPath}': ${(e as Error).message}`,
+            { cause: e },
+          );
+        }
+      }
+      return resolved;
+    })();
+    memo.set(componentPath, args);
+  }
+  return args;
+}
+
+/**
+ * Resolve one argument passed in `use(component, { args })` like the backend
+ * does: a function reference becomes a handle to the parent's function, a
+ * child component (or a namespace of one) becomes an object of handles to its
+ * public functions, and `component.args.<name>` becomes the parent's own
+ * argument.
+ */
+async function resolveComponentArg(
+  arg: unknown,
+  parentPath: string,
+  parentArgs: Record<string, Value> | null,
+): Promise<Value> {
+  if (typeof arg === "object" && arg !== null && !Array.isArray(arg)) {
+    if (typeof (arg as any).__envVarRef === "string") {
+      throw new Error(
+        "A component argument can't be an environment variable. Pass it with the `env` option instead.",
+      );
+    }
+    const argRef = (arg as any).__componentArgRef;
+    if (typeof argRef === "string") {
+      if (parentArgs === null || !(argRef in parentArgs)) {
+        const parent =
+          parentPath === ROOT_COMPONENT_PATH
+            ? "The app"
+            : `Component '${parentPath}'`;
+        throw new Error(`${parent} has no argument named '${argRef}'.`);
+      }
+      return parentArgs[argRef];
+    }
+    const address = functionAddressOf(arg);
+    if (address?.name !== undefined) {
+      const functionPath = { componentPath: parentPath, udfPath: address.name };
+      try {
+        await resolveFunction(functionPath, "any");
+      } catch {
+        throw new Error(
+          `${address.name} isn't a function in component "${parentPath}".`,
+        );
+      }
+      return createFunctionHandle(functionPath);
+    }
+    if (address?.reference !== undefined) {
+      return await resolveChildComponentReference(
+        address.reference,
+        parentPath,
+      );
+    }
+    if (isSimpleObject(arg)) {
+      const fields: Record<string, Value> = {};
+      for (const [key, field] of Object.entries(arg)) {
+        if (field !== undefined) {
+          fields[key] = await resolveComponentArg(
+            field,
+            parentPath,
+            parentArgs,
+          );
+        }
+      }
+      return fields;
+    }
+  }
+  if (Array.isArray(arg)) {
+    const elements: Value[] = [];
+    for (const element of arg) {
+      elements.push(await resolveComponentArg(element, parentPath, parentArgs));
+    }
+    return elements;
+  }
+  try {
+    convexToJson(arg as Value);
+  } catch (e) {
+    throw new Error(`It isn't a valid argument: ${(e as Error).message}`, {
+      cause: e,
+    });
+  }
+  return arg as Value;
+}
+
+function functionAddressOf(
+  value: object,
+): { name?: string; reference?: string } | undefined {
+  try {
+    return getFunctionAddress(value);
+  } catch {
+    return undefined;
+  }
+}
+
+// "_reference/childComponent/{name}/{attributes...}"
+async function resolveChildComponentReference(
+  reference: string,
+  parentPath: string,
+): Promise<Value> {
+  const [, , name, ...attributes] = reference.split("/");
+  const childPath =
+    parentPath === ROOT_COMPONENT_PATH ? name : `${parentPath}/${name}`;
+  if (getConvexGlobal().components[childPath] === undefined) {
+    throw new Error(
+      `The parent has no child component named '${name}'. Register it before running the inits.`,
+    );
+  }
+  let exports: ExportTree | string = await componentExports(childPath);
+  for (const attribute of attributes) {
+    exports = typeof exports === "string" ? undefined! : exports[attribute];
+    if (exports === undefined) {
+      throw new Error(
+        `Child component '${name}' doesn't export '${attributes.join(".")}'.`,
+      );
+    }
+  }
+  if (typeof exports !== "string" && Object.keys(exports).length === 0) {
+    const location =
+      attributes.length === 0 ? "" : ` under '${attributes.join(".")}'`;
+    throw new Error(
+      `Child component '${name}' doesn't export any functions${location}.`,
+    );
+  }
+  return exportsToHandles(childPath, exports);
+}
+
+// Leaves are UDF paths.
+type ExportTree = { [name: string]: ExportTree | string };
+
+/**
+ * A component's exports: its public functions, by module path and export
+ * name, like the backend's file-based exports.
+ */
+async function componentExports(componentPath: string): Promise<ExportTree> {
+  const modules = getModulesForComponent(componentPath);
+  const tree: ExportTree = {};
+  for (const modulePath of modules.paths) {
+    if (
+      modulePath === CONFIG ||
+      modulePath === "schema" ||
+      modulePath.startsWith("_generated/") ||
+      /\.(test|spec)$/.test(modulePath)
+    ) {
+      continue;
+    }
+    const module = await modules(modulePath);
+    for (const [exportName, func] of Object.entries(module ?? {})) {
+      const f = func as any;
+      if (!f?.isPublic || !(f.isQuery || f.isMutation || f.isAction)) {
+        continue;
+      }
+      let node = tree;
+      for (const segment of modulePath.split("/")) {
+        const child = node[segment];
+        if (typeof child === "string") {
+          throw new Error(
+            `${modulePath}:${exportName} conflicts with an existing export.`,
+          );
+        }
+        node = node[segment] = child ?? {};
+      }
+      node[exportName] = `${modulePath}:${exportName}`;
+    }
+  }
+  return tree;
+}
+
+function exportsToHandles(
+  componentPath: string,
+  exports: ExportTree | string,
+): Value {
+  if (typeof exports === "string") {
+    return createFunctionHandle({ componentPath, udfPath: exports });
+  }
+  return Object.fromEntries(
+    Object.entries(exports).map(([name, child]) => [
+      name,
+      exportsToHandles(componentPath, child),
+    ]),
+  );
+}
+
+function initFailedError(failures: string[]) {
+  const whatFailed =
+    failures.length === 1
+      ? "an init failed"
+      : `${failures.length} inits failed`;
+  return new Error(
+    `The push was rolled back because ${whatFailed}:\n\n${failures.join("\n\n")}`,
+  );
+}
+
+/**
+ * The runtime makes environment variables unavailable to inits, on every
+ * read. Generated `env` exports hold the `process.env` object itself, so
+ * guard that object rather than the `process` global, before function modules
+ * load. Outside inits it behaves like the original object.
+ */
+let guardedEnv: object | null = null;
+function guardEnvironmentVariablesInInits() {
+  if (typeof process === "undefined" || process.env === guardedEnv) {
+    return;
+  }
+  const check = () => {
+    if (executionContextStorage.getStore()?.udfType === "init") {
+      throw new Error("Can't use environment variables in an init function.");
+    }
+  };
+  const env = process.env;
+  guardedEnv = new Proxy(env, {
+    get(target, property) {
+      check();
+      return Reflect.get(target, property);
+    },
+    has(target, property) {
+      check();
+      return Reflect.has(target, property);
+    },
+    ownKeys(target) {
+      check();
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      check();
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+    set(target, property, value) {
+      check();
+      return Reflect.set(target, property, value);
+    },
+    deleteProperty(target, property) {
+      check();
+      return Reflect.deleteProperty(target, property);
+    },
+  });
+  process.env = guardedEnv as NodeJS.ProcessEnv;
 }
 
 // Capture before fake timers are installed.
@@ -3778,6 +4289,7 @@ function withAuth(
     isNested: boolean,
     transactionLimits?: Partial<TransactionMetrics>,
     isInternal = false,
+    udfType: "mutation" | "init" = "mutation",
   ): Promise<T> => {
     // The wrapper decides what `ctx.meta.getFunctionMetadata()` reports as the
     // function's visibility, so match how the function was registered.
@@ -3801,7 +4313,7 @@ function withAuth(
     const childCtx: ExecutionContext = {
       componentPath: functionPath.componentPath,
       udfPath: functionPath.udfPath,
-      udfType: "mutation",
+      udfType,
       depth: (parentCtx?.depth ?? 0) + 1,
     };
     const requestMetadata = requestMetadataForExecution();
@@ -4241,9 +4753,55 @@ function withAuth(
       throw deserializeConvexErrorData(e);
     }
   };
+  // The push's transaction: a top-level mutation that runs each init in a
+  // nested transaction with the init limits.
+  const runInitMutations = async (calls: ComponentInitCall[]) => {
+    await runMutationWithHandler(
+      async () => {
+        const lock = nestedTxStorage.getStore()!;
+        const failures: string[] = [];
+        for (const { componentPath, resolved, args } of calls) {
+          await lock.acquire();
+          try {
+            const result = await runMutationWithHandler(
+              resolved.handler,
+              args,
+              {},
+              resolved.functionPath,
+              /* isNested */ true,
+              INIT_TRANSACTION_LIMITS,
+              /* isInternal */ true,
+              "init",
+            );
+            validateReturnValue(
+              resolved.returns,
+              result,
+              "mutation",
+              resolved.functionPath,
+            );
+          } catch (e) {
+            failures.push(
+              `init ${resolved.functionPath.udfPath} of component "${componentPath}":\n${(e as Error).message}`,
+            );
+          } finally {
+            lock.release();
+          }
+        }
+        if (failures.length > 0) {
+          throw initFailedError(failures);
+        }
+      },
+      {},
+      {},
+      { componentPath: ROOT_COMPONENT_PATH, udfPath: "push" },
+      /* isNested */ false,
+    );
+  };
+
   return {
     ...byType,
     ...byTypeWithPath,
+    runInitMutations,
 
     runInComponent: run,
     run: async <T>(handler: (ctx: any) => T) => {
