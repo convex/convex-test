@@ -32,8 +32,8 @@ export const snapshotMutation = mutation({
   },
 });
 
-// Reports the clocks a transaction observes, for checking that
-// `snapshotTs <= Date.now() <= _creationTime` like the Convex backend.
+// Reports the snapshot timestamp, pinned wall time, and document creation time
+// observed by one transaction.
 export const insertAtPinnedTime = mutation({
   args: {},
   returns: v.object({
