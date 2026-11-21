@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.74
+
+### Patch Changes
+
+- 422499c: Support `v.function()` validators in arguments, return values, and schemas. (#182)
+
 ## 0.0.73
 
 ### Patch Changes
