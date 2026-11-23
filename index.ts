@@ -954,6 +954,7 @@ class DatabaseFake {
       }
 
       validateFieldNames(table.documentType);
+      validateValidatorDefinition(table.documentType);
 
       table.indexes.forEach(({ indexDescriptor }) => {
         if (!isValidIdentifier(indexDescriptor)) {
@@ -1369,6 +1370,29 @@ type ValidatorJSON =
   | { type: "object"; value: Record<string, ObjectFieldType> }
   | { type: "union"; value: ValidatorJSON[] };
 
+// The backend rejects invalid validator definitions when parsing them, before
+// any value is checked, so walk the whole validator up front.
+function validateValidatorDefinition(validator: ValidatorJSON) {
+  switch (validator.type) {
+    case "array":
+      validateValidatorDefinition(validator.value);
+      return;
+    case "union":
+      validator.value.forEach(validateValidatorDefinition);
+      return;
+    case "object":
+      Object.values(validator.value).forEach(({ fieldType }) =>
+        validateValidatorDefinition(fieldType),
+      );
+      return;
+    case "record":
+      validateRecordDefinition(validator);
+      validateValidatorDefinition(validator.keys);
+      validateValidatorDefinition(validator.values.fieldType);
+      return;
+  }
+}
+
 // Mirrors the backend's checks when it parses a record validator.
 function validateRecordDefinition(
   validator: Extract<ValidatorJSON, { type: "record" }>,
@@ -1478,11 +1502,11 @@ function validateValidator(validator: ValidatorJSON, value: any) {
       return;
     }
     case "literal": {
-      if (value !== jsonToConvex(validator.value)) {
+      const expected = jsonToConvex(validator.value);
+      // Like the backend, distinguish -0 from 0 and match NaN with NaN.
+      if (!Object.is(value, expected)) {
         throw new Error(
-          `Validator error: Expected \`${
-            validator.value as any
-          }\`, got \`${value}\``,
+          `Validator error: Expected \`${expected as any}\`, got \`${value}\``,
         );
       }
       return;
@@ -1512,7 +1536,6 @@ function validateValidator(validator: ValidatorJSON, value: any) {
       return;
     }
     case "record": {
-      validateRecordDefinition(validator);
       if (
         typeof value !== "object" ||
         value === null ||
@@ -4648,7 +4671,11 @@ async function resolveFunction<T extends RegisteredFunctionKind>(
         `Args validator must be an object or any`,
     );
   }
-  const returns = JSON.parse(func.exportReturns());
+  const returns = JSON.parse(func.exportReturns()) as ValidatorJSON | null;
+  validateValidatorDefinition(args);
+  if (returns !== null) {
+    validateValidatorDefinition(returns);
+  }
 
   const isInternal = (func as { isInternal?: boolean }).isInternal === true;
 

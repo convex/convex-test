@@ -47,6 +47,20 @@ function setup() {
             args: { scores: v.record(v.number() as any, v.number()) },
             handler: () => null,
           }),
+          optionalLiteralKeys: query({
+            args: {
+              scores: v.optional(v.record(v.literal("ada") as any, v.number())),
+            },
+            handler: () => null,
+          }),
+          negativeZero: query({
+            args: { scores: v.record(v.string(), v.literal(-0)) },
+            handler: () => null,
+          }),
+          nan: query({
+            args: { scores: v.record(v.string(), v.literal(NaN)) },
+            handler: () => null,
+          }),
           insertThenReturn: mutation({
             args: { value: v.any() },
             returns: record,
@@ -205,6 +219,36 @@ test.each([
   await expect(
     t.query(anyApi.records[name], { scores: { ada: 1 } }),
   ).rejects.toThrow(message);
+});
+
+test("invalid record validators are rejected even when no value is checked", async () => {
+  const t = setup();
+  await expect(t.query(anyApi.records.optionalLiteralKeys, {})).rejects.toThrow(
+    "Records cannot have string literal keys",
+  );
+  expect(() =>
+    convexTest({
+      schema: defineSchema({
+        scores: defineTable({
+          byPlayer: v.optional(v.record(v.literal("ada") as any, v.number())),
+        }),
+      }),
+      modules: { "./_generated/server.ts": () => Promise.resolve({}) },
+    }),
+  ).toThrow("Records cannot have string literal keys");
+});
+
+test("float literals distinguish -0 and match NaN", async () => {
+  const t = setup();
+  await expect(
+    t.query(anyApi.records.negativeZero, { scores: { ada: -0 } }),
+  ).resolves.toBeNull();
+  await expect(
+    t.query(anyApi.records.negativeZero, { scores: { ada: 0 } }),
+  ).rejects.toThrow("Validator error");
+  await expect(
+    t.query(anyApi.records.nan, { scores: { ada: NaN } }),
+  ).resolves.toBeNull();
 });
 
 test("mutation writes roll back when the return value is invalid", async () => {
