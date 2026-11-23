@@ -1369,6 +1369,44 @@ type ValidatorJSON =
   | { type: "object"; value: Record<string, ObjectFieldType> }
   | { type: "union"; value: ValidatorJSON[] };
 
+// Mirrors the backend's checks when it parses a record validator.
+function validateRecordDefinition(
+  validator: Extract<ValidatorJSON, { type: "record" }>,
+) {
+  if (!isStringSubtype(validator.keys)) {
+    throw new Error(
+      `Records can only have string keys. Your validator contains a record with key typed as \`${validator.keys.type}\`, which is not a subtype of \`v.string()\``,
+    );
+  }
+  if (hasStringLiteral(validator.keys)) {
+    throw new Error("Records cannot have string literal keys");
+  }
+}
+
+function isStringSubtype(validator: ValidatorJSON): boolean {
+  switch (validator.type) {
+    case "string":
+    case "id":
+      return true;
+    case "literal":
+      return typeof validator.value === "string";
+    case "union":
+      return validator.value.every(isStringSubtype);
+    default:
+      return false;
+  }
+}
+
+function hasStringLiteral(validator: ValidatorJSON): boolean {
+  if (validator.type === "literal") {
+    return typeof validator.value === "string";
+  }
+  if (validator.type === "union") {
+    return validator.value.some(hasStringLiteral);
+  }
+  return false;
+}
+
 function validateValidator(validator: ValidatorJSON, value: any) {
   switch (validator.type) {
     case "null": {
@@ -1440,7 +1478,7 @@ function validateValidator(validator: ValidatorJSON, value: any) {
       return;
     }
     case "literal": {
-      if (value !== validator.value) {
+      if (value !== jsonToConvex(validator.value)) {
         throw new Error(
           `Validator error: Expected \`${
             validator.value as any
@@ -1474,12 +1512,21 @@ function validateValidator(validator: ValidatorJSON, value: any) {
       return;
     }
     case "record": {
-      if (value === null || !isSimpleObject(value)) {
+      validateRecordDefinition(validator);
+      if (
+        typeof value !== "object" ||
+        value === null ||
+        !isSimpleObject(value)
+      ) {
         throw new Error(
           `Validator error: Expected a plain old JavaScript \`object\`, got \`${value}\``,
         );
       }
       for (const [key, entry] of Object.entries(value)) {
+        // The client drops `undefined` entries when serializing.
+        if (entry === undefined) {
+          continue;
+        }
         validateValidator(validator.keys, key);
         validateValidator(validator.values.fieldType, entry);
       }
@@ -3791,6 +3838,7 @@ function withAuth(
     isNested: boolean,
     transactionLimits?: Partial<TransactionMetrics>,
     isInternal = false,
+    validateResult?: (result: unknown) => void,
   ): Promise<T> => {
     // The wrapper decides what `ctx.meta.getFunctionMetadata()` reports as the
     // function's visibility, so match how the function was registered.
@@ -3839,9 +3887,12 @@ function withAuth(
         );
 
       const rawResult = await nestedTxStorage.run(childLock, invokeInContext);
+      const result = jsonToConvex(JSON.parse(rawResult));
+      // Like the backend, a return value that fails validation rolls back
+      // the mutation's writes.
+      validateResult?.(result);
 
       const commitTs = transactionManager.commit(isNested);
-      const result = jsonToConvex(JSON.parse(rawResult));
       return commitTs === null
         ? (result as T)
         : (resolveCommittedValues(result, commitTs) as T);
@@ -4087,7 +4138,7 @@ function withAuth(
           isNested,
         );
 
-        const result = await runMutationWithHandler(
+        return await runMutationWithHandler(
           resolved.handler,
           args,
           {},
@@ -4095,14 +4146,14 @@ function withAuth(
           isNested,
           transactionLimits,
           resolved.isInternal,
+          (result) =>
+            validateReturnValue(
+              resolved.returns,
+              result,
+              "mutation",
+              resolved.functionPath,
+            ),
         );
-        validateReturnValue(
-          resolved.returns,
-          result,
-          "mutation",
-          resolved.functionPath,
-        );
-        return result;
       } finally {
         if (parentLock) {
           parentLock.release();

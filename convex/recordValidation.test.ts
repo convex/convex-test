@@ -26,6 +26,35 @@ function setup() {
             args: { scores: v.record(v.id("scores"), v.number()) },
             handler: () => null,
           }),
+          bigintLiteral: query({
+            args: { scores: v.record(v.string(), v.literal(1n)) },
+            handler: () => null,
+          }),
+          literalKeys: query({
+            args: { scores: v.record(v.literal("ada") as any, v.number()) },
+            handler: () => null,
+          }),
+          literalKeyUnion: query({
+            args: {
+              scores: v.record(
+                v.union(v.string(), v.literal("ada")) as any,
+                v.number(),
+              ),
+            },
+            handler: () => null,
+          }),
+          numberKeys: query({
+            args: { scores: v.record(v.number() as any, v.number()) },
+            handler: () => null,
+          }),
+          insertThenReturn: mutation({
+            args: { value: v.any() },
+            returns: record,
+            handler: async (ctx, { value }) => {
+              await (ctx.db as any).insert("scores", { byPlayer: {} });
+              return value;
+            },
+          }),
           nested: query({
             args: {
               scores: v.record(v.string(), v.record(v.string(), v.number())),
@@ -145,4 +174,49 @@ test("record values are validated recursively", async () => {
   await expect(
     t.query(anyApi.records.nested, { scores: { round: { ada: "one" } } }),
   ).rejects.toThrow("Validator error");
+});
+
+test("undefined record entries are ignored, like the client drops them", async () => {
+  const t = setup();
+  await expect(
+    t.query(anyApi.records.query, { scores: { ada: 1, grace: undefined } }),
+  ).resolves.toBeNull();
+  await expect(
+    t.query(anyApi.records.returns, { value: { ada: 1, grace: undefined } }),
+  ).resolves.toEqual({ ada: 1 });
+});
+
+test("record values can be bigint literals", async () => {
+  const t = setup();
+  await expect(
+    t.query(anyApi.records.bigintLiteral, { scores: { ada: 1n } }),
+  ).resolves.toBeNull();
+  await expect(
+    t.query(anyApi.records.bigintLiteral, { scores: { ada: 2n } }),
+  ).rejects.toThrow("Validator error");
+});
+
+test.each([
+  ["literalKeys", "Records cannot have string literal keys"],
+  ["literalKeyUnion", "Records cannot have string literal keys"],
+  ["numberKeys", "Records can only have string keys"],
+])("invalid record validator %s is rejected", async (name, message) => {
+  const t = setup();
+  await expect(
+    t.query(anyApi.records[name], { scores: { ada: 1 } }),
+  ).rejects.toThrow(message);
+});
+
+test("mutation writes roll back when the return value is invalid", async () => {
+  const t = setup();
+  await expect(
+    t.mutation(anyApi.records.insertThenReturn, { value: { ada: "one" } }),
+  ).rejects.toThrow("Return value validation failed");
+  expect(await t.run((ctx) => ctx.db.query("scores").collect())).toEqual([]);
+  await expect(
+    t.mutation(anyApi.records.insertThenReturn, { value: { ada: 1 } }),
+  ).resolves.toEqual({ ada: 1 });
+  expect(await t.run((ctx) => ctx.db.query("scores").collect())).toHaveLength(
+    1,
+  );
 });
