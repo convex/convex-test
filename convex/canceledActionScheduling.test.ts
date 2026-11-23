@@ -41,6 +41,32 @@ const modules = {
           label,
         }),
     }),
+    fail: app.internalMutation({
+      args: {},
+      returns: v.null(),
+      handler: async () => {
+        throw new Error("scheduled failure");
+      },
+    }),
+    cancelThenThrow: app.internalAction({
+      args: {},
+      returns: v.null(),
+      handler: async (ctx) => {
+        const { scheduledFunctionId } = await ctx.meta.getRequestMetadata();
+        await ctx.scheduler.cancel(
+          scheduledFunctionId as GenericId<"_scheduled_functions">,
+        );
+        throw new Error("thrown after cancellation");
+      },
+    }),
+    cancelFromAction: app.internalAction({
+      args: { id: v.id("_scheduled_functions") },
+      returns: v.null(),
+      handler: async (ctx, { id }) => {
+        await ctx.scheduler.cancel(id);
+        return null;
+      },
+    }),
     jobs: app.internalQuery({
       args: {},
       returns: v.any(),
@@ -228,4 +254,47 @@ test("component scheduling checks the owning database even when IDs collide", as
   ).toEqual(["pending", "canceled"]);
   expect(vi.getTimerCount()).toBe(2);
   await t.finishAllScheduledFunctions(vi.runAllTimers);
+});
+
+test("a canceled action that later throws stays canceled", async () => {
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  const t = fixture.createTest();
+  const id = await t.mutation(async (ctx) =>
+    ctx.scheduler.runAfter(0, fixture.internal.probe.cancelThenThrow, {}),
+  );
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+  const job = await t.query(async (ctx) => ctx.db.system.get(id));
+  expect(job?.state.kind).toBe("canceled");
+  expect(job?.completedTime).toEqual(expect.any(Number));
+  expect(error).toHaveBeenCalled();
+  error.mockRestore();
+});
+
+test("canceling a finished job leaves its state unchanged", async () => {
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  const t = fixture.createTest();
+  const [succeeded, failed] = await t.mutation(async (ctx) => [
+    await ctx.scheduler.runAfter(0, fixture.internal.probe.child, {
+      label: "done",
+    }),
+    await ctx.scheduler.runAfter(0, fixture.internal.probe.fail, {}),
+  ]);
+  await t.finishAllScheduledFunctions(vi.runAllTimers);
+  const before = await t.query(async (ctx) => [
+    await ctx.db.system.get(succeeded),
+    await ctx.db.system.get(failed),
+  ]);
+  expect(before.map((job) => job?.state.kind)).toEqual(["success", "failed"]);
+  for (const id of [succeeded, failed]) {
+    await t.mutation(async (ctx) => {
+      await ctx.scheduler.cancel(id);
+    });
+    await t.action(fixture.internal.probe.cancelFromAction, { id });
+  }
+  const after = await t.query(async (ctx) => [
+    await ctx.db.system.get(succeeded),
+    await ctx.db.system.get(failed),
+  ]);
+  expect(after).toEqual(before);
+  error.mockRestore();
 });

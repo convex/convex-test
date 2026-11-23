@@ -1844,15 +1844,17 @@ async function runScheduledFunction({
   // A scheduled function is its own request: it doesn't inherit the request
   // metadata of whoever scheduled it, and it identifies itself through its
   // job ID.
-  const requestMetadata: RequestMetadataFake = {
-    ip: null,
-    userAgent: null,
-    requestId: newRequestId(),
-    scheduledFunctionId: jobId,
-    _scheduledFunctionComponentPath: componentPath,
-    authToken: null,
+  const requestContext: RequestContextFake = {
+    metadata: {
+      ip: null,
+      userAgent: null,
+      requestId: newRequestId(),
+      scheduledFunctionId: jobId,
+      authToken: null,
+    },
+    scheduledFunctionComponentPath: componentPath,
   };
-  await requestMetadataStorage.run(requestMetadata, () =>
+  await requestContextStorage.run(requestContext, () =>
     authStorage.run(new AuthFake(), async () => {
       const canceled = await withAuth().runInComponent(
         componentPath,
@@ -1882,6 +1884,14 @@ async function runScheduledFunction({
       } catch (error) {
         console.error(`Error when running scheduled function ${name}`, error);
         await withAuth().runInComponent(componentPath, async () => {
+          const job = db.get(
+            "_scheduled_functions",
+            jobId,
+          ) as ScheduledFunction;
+          // Like the backend, completing a canceled job leaves it canceled.
+          if (job.state.kind === "canceled") {
+            return;
+          }
           db.patch("_scheduled_functions", jobId, {
             state: { kind: "failed" },
             completedTime: Date.now(),
@@ -1905,6 +1915,26 @@ async function runScheduledFunction({
       });
     }),
   );
+}
+
+// Cancels a job that hasn't finished yet. Like the backend, canceling a job
+// that already succeeded, failed, or was canceled leaves it unchanged.
+function cancelScheduledFunction(
+  db: DatabaseFake,
+  id: GenericId<"_scheduled_functions">,
+) {
+  const job = db.get("_scheduled_functions", id) as ScheduledFunction | null;
+  if (
+    job !== null &&
+    job.state.kind !== "pending" &&
+    job.state.kind !== "inProgress"
+  ) {
+    return;
+  }
+  db.patch("_scheduled_functions", id, {
+    state: { kind: "canceled" },
+    completedTime: Date.now(),
+  });
 }
 
 function asyncSyscallImpl() {
@@ -2029,7 +2059,7 @@ function asyncSyscallImpl() {
       }
       case "1.0/getRequestMetadata": {
         const ctx = executionContextStorage.getStore();
-        const requestMetadata = requestMetadataStorage.getStore();
+        const requestMetadata = requestContextStorage.getStore()?.metadata;
         if (ctx === undefined || requestMetadata === undefined) {
           throw new Error(
             "getRequestMetadata() can only be called from a mutation, action " +
@@ -2043,17 +2073,7 @@ function asyncSyscallImpl() {
               "or HTTP action. It is not available in queries.",
           );
         }
-        const { ip, userAgent, requestId, scheduledFunctionId, authToken } =
-          requestMetadata;
-        return JSON.stringify(
-          convexToJson({
-            ip,
-            userAgent,
-            requestId,
-            scheduledFunctionId,
-            authToken,
-          }),
-        );
+        return JSON.stringify(convexToJson(requestMetadata));
       }
       case "1.0/getDeploymentMetadata": {
         return JSON.stringify(
@@ -2185,15 +2205,17 @@ function asyncSyscallImpl() {
 
         tracker?.trackScheduledFunction(getConvexSize(parsedArgs));
 
-        const metadata = requestMetadataStorage.getStore();
         // IDs can collide between component databases, so look up the parent
         // in the component that owns its scheduled-function document.
+        const requestContext = requestContextStorage.getStore();
         const parentJob =
-          metadata?.scheduledFunctionId &&
-          metadata._scheduledFunctionComponentPath !== undefined
-            ? (getDbForComponent(metadata._scheduledFunctionComponentPath).get(
+          requestContext?.metadata.scheduledFunctionId &&
+          requestContext.scheduledFunctionComponentPath !== null
+            ? (getDbForComponent(
+                requestContext.scheduledFunctionComponentPath,
+              ).get(
                 "_scheduled_functions",
-                metadata.scheduledFunctionId,
+                requestContext.metadata.scheduledFunctionId,
               ) as ScheduledFunction | null)
             : null;
         const canceled = parentJob?.state.kind === "canceled";
@@ -2246,14 +2268,10 @@ function asyncSyscallImpl() {
         return JSON.stringify(convexToJson(jobId));
       }
       case "1.0/actions/cancel_job": {
-        // TODO: A canceled action should stay canceled if it later throws,
-        // and canceling a terminal job should leave its state unchanged.
         await withAuth().run(async () => {
           // Actions may cancel their own job; only mutation cancellation
           // checks the scheduled request ID.
-          db.patch("_scheduled_functions", args.id, {
-            state: { kind: "canceled" },
-          });
+          cancelScheduledFunction(db, args.id);
         });
         return JSON.stringify({});
       }
@@ -2273,7 +2291,9 @@ function asyncSyscallImpl() {
       }
       case "1.0/cancel_job": {
         const { id } = args;
-        if (requestMetadataStorage.getStore()?.scheduledFunctionId === id) {
+        if (
+          requestContextStorage.getStore()?.metadata.scheduledFunctionId === id
+        ) {
           // The backend gates this on the function's installed Convex version.
           const [major, minor] = version.split(".").map(Number);
           if (major > 1 || (major === 1 && minor >= 50)) {
@@ -2286,7 +2306,7 @@ function asyncSyscallImpl() {
           );
           return JSON.stringify(null);
         }
-        db.patch("_scheduled_functions", id, { state: { kind: "canceled" } });
+        cancelScheduledFunction(db, id);
         return JSON.stringify({});
       }
       case "1.0/storageDelete": {
@@ -3072,17 +3092,24 @@ type RequestMetadataFake = {
   userAgent: string | null;
   requestId: string;
   scheduledFunctionId: GenericId<"_scheduled_functions"> | null;
-  // Internal ownership for component-scoped job lookups; excluded from the
-  // public request metadata returned by the syscall.
-  _scheduledFunctionComponentPath?: string;
   authToken: string | null;
 };
 
-// The request metadata of the innermost top-level function execution. Nested
+// Per-request state: the metadata `getRequestMetadata()` returns verbatim,
+// plus internal bookkeeping that must never be exposed through it.
+type RequestContextFake = {
+  metadata: RequestMetadataFake;
+  // The component whose `_scheduled_functions` table holds
+  // `metadata.scheduledFunctionId`. IDs can collide between component
+  // databases, so job lookups need both.
+  scheduledFunctionComponentPath: string | null;
+};
+
+// The request context of the innermost top-level function execution. Nested
 // calls (including calls into components) inherit it, so it is only created
 // when a function is called from the test itself, and replaced when a
 // scheduled function starts.
-const requestMetadataStorage = new AsyncLocalStorage<RequestMetadataFake>();
+const requestContextStorage = new AsyncLocalStorage<RequestContextFake>();
 
 // The request attributes a test accessor was configured with, which only
 // apply to the functions the accessor itself calls.
@@ -3776,14 +3803,17 @@ function withAuth(
 
   // Nested calls, including calls into components, run as part of the request
   // that triggered the outermost function, so they share its metadata.
-  function requestMetadataForExecution(): RequestMetadataFake {
+  function requestContextForExecution(): RequestContextFake {
     return (
-      requestMetadataStorage.getStore() ?? {
-        ip: requestOptions.ip,
-        userAgent: requestOptions.userAgent,
-        requestId: newRequestId(),
-        scheduledFunctionId: null,
-        authToken: auth.token,
+      requestContextStorage.getStore() ?? {
+        metadata: {
+          ip: requestOptions.ip,
+          userAgent: requestOptions.userAgent,
+          requestId: newRequestId(),
+          scheduledFunctionId: null,
+          authToken: auth.token,
+        },
+        scheduledFunctionComponentPath: null,
       }
     );
   }
@@ -3822,7 +3852,7 @@ function withAuth(
       udfType: "mutation",
       depth: (parentCtx?.depth ?? 0) + 1,
     };
-    const requestMetadata = requestMetadataForExecution();
+    const requestContext = requestContextForExecution();
 
     await transactionManager.begin(isNested, transactionLimits);
     const childLock = new NestedLock(
@@ -3838,7 +3868,7 @@ function withAuth(
         ).invokeMutation(JSON.stringify(convexToJson([parseArgs(args)])));
       const invokeInContext = () =>
         executionContextStorage.run(childCtx, () =>
-          requestMetadataStorage.run(requestMetadata, () =>
+          requestContextStorage.run(requestContext, () =>
             authStorage.run(authForChild, invokeRaw),
           ),
         );
@@ -3889,7 +3919,7 @@ function withAuth(
       depth: (parentCtx?.depth ?? 0) + 1,
       pagination: (isNested && parentCtx?.pagination) || { calls: 0 },
     };
-    const requestMetadata = requestMetadataForExecution();
+    const requestContext = requestContextForExecution();
 
     await transactionManager.begin(isNested, transactionLimits);
     const childLock = new NestedLock(
@@ -3903,7 +3933,7 @@ function withAuth(
         ).invokeQuery(JSON.stringify(convexToJson([parseArgs(args)])));
       const invokeInContext = () =>
         executionContextStorage.run(childCtx, () =>
-          requestMetadataStorage.run(requestMetadata, () =>
+          requestContextStorage.run(requestContext, () =>
             authStorage.run(authForChild, invokeRaw),
           ),
         );
@@ -3957,25 +3987,23 @@ function withAuth(
       udfType: "action",
       depth: (parentCtx?.depth ?? 0) + 1,
     };
-    const requestMetadata = requestMetadataForExecution();
+    const requestContext = requestContextForExecution();
     return await executionContextStorage.run(childCtx, async () => {
       try {
-        const rawResult = await requestMetadataStorage.run(
-          requestMetadata,
-          () =>
-            authStorage.run(authForChild, () =>
-              (
-                a as unknown as {
-                  invokeAction: (
-                    requestId: string,
-                    args: string,
-                  ) => Promise<string>;
-                }
-              ).invokeAction(
-                requestMetadata.requestId,
-                JSON.stringify(convexToJson([parseArgs(args)])),
-              ),
+        const rawResult = await requestContextStorage.run(requestContext, () =>
+          authStorage.run(authForChild, () =>
+            (
+              a as unknown as {
+                invokeAction: (
+                  requestId: string,
+                  args: string,
+                ) => Promise<string>;
+              }
+            ).invokeAction(
+              requestContext.metadata.requestId,
+              JSON.stringify(convexToJson([parseArgs(args)])),
             ),
+          ),
         );
         return jsonToConvex(JSON.parse(rawResult)) as T;
       } catch (e) {
@@ -4242,15 +4270,15 @@ function withAuth(
         );
       },
     });
-    const requestMetadata = requestMetadataForExecution();
+    const requestContext = requestContextForExecution();
     try {
-      const rawResult = await requestMetadataStorage.run(requestMetadata, () =>
+      const rawResult = await requestContextStorage.run(requestContext, () =>
         (
           a as unknown as {
             invokeAction: (requestId: string, args: string) => Promise<string>;
           }
         ).invokeAction(
-          requestMetadata.requestId,
+          requestContext.metadata.requestId,
           JSON.stringify(convexToJson([{}])),
         ),
       );
@@ -4312,9 +4340,9 @@ function withAuth(
       };
       // The request's headers are not inspected: like the identity, the IP and
       // the user agent are configured on the test accessor.
-      const requestMetadata = requestMetadataForExecution();
+      const requestContext = requestContextForExecution();
       const response = await executionContextStorage.run(httpCtx, () =>
-        requestMetadataStorage.run(requestMetadata, () =>
+        requestContextStorage.run(requestContext, () =>
           (
             a as unknown as {
               invokeHttpAction: (request: Request) => Promise<Response>;
