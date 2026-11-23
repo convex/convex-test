@@ -245,7 +245,7 @@ test("float literals distinguish -0 and match NaN", async () => {
   ).resolves.toBeNull();
   await expect(
     t.query(anyApi.records.negativeZero, { scores: { ada: 0 } }),
-  ).rejects.toThrow("Validator error");
+  ).rejects.toThrow("Validator error: Expected `-0`, got `0`");
   await expect(
     t.query(anyApi.records.nan, { scores: { ada: NaN } }),
   ).resolves.toBeNull();

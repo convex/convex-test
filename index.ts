@@ -1431,6 +1431,10 @@ function hasStringLiteral(validator: ValidatorJSON): boolean {
   return false;
 }
 
+function formatLiteral(value: unknown) {
+  return Object.is(value, -0) ? "-0" : `${value as any}`;
+}
+
 function validateValidator(validator: ValidatorJSON, value: any) {
   switch (validator.type) {
     case "null": {
@@ -1506,7 +1510,7 @@ function validateValidator(validator: ValidatorJSON, value: any) {
       // Like the backend, distinguish -0 from 0 and match NaN with NaN.
       if (!Object.is(value, expected)) {
         throw new Error(
-          `Validator error: Expected \`${expected as any}\`, got \`${value}\``,
+          `Validator error: Expected \`${formatLiteral(expected)}\`, got \`${formatLiteral(value)}\``,
         );
       }
       return;
