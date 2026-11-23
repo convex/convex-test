@@ -2173,6 +2173,9 @@ function asyncSyscallImpl() {
         const functionPath = getFunctionPathFromAddress(functionAddress);
         // Load the component eagerly so a missing registration fails here.
         getComponentInfo(functionPath.componentPath);
+        // The backend rejects a missing target here, inside the scheduling
+        // transaction, so a bad target never becomes a job.
+        await validateScheduledFunction(functionPath);
         // Convert args to a Convex value before storing them or passing them to the function
         const parsedArgs = jsonToConvex(fnArgs);
         // Scheduled arguments cannot contain pending values
@@ -4442,8 +4445,49 @@ function createFunctionHandle(functionPath: FunctionPath) {
 }
 
 function parseFunctionHandle(handle: string) {
-  const [componentPath, udfPath] = handle.split("function://")[1].split(";");
+  const [componentPath, udfPath, ...rest] = handle
+    .slice("function://".length)
+    .split(";");
+  if (
+    !handle.startsWith("function://") ||
+    udfPath === undefined ||
+    udfPath === "" ||
+    rest.length > 0
+  ) {
+    throw new Error(`Invalid function handle: "${handle}"`);
+  }
   return { componentPath, udfPath };
+}
+
+// Mirrors the backend's `validate_schedule_args`: the module must exist and
+// must export a Convex function under the scheduled name. Errors use the
+// backend's wording.
+async function validateScheduledFunction(functionPath: FunctionPath) {
+  const [modulePath, maybeExportName] = functionPath.udfPath.split(":");
+  const exportName =
+    maybeExportName === undefined ? "default" : maybeExportName;
+  const { componentPath } = functionPath;
+  let module: Record<string, any>;
+  try {
+    module = await getModulesForComponent(componentPath)(modulePath);
+  } catch (e) {
+    if (e instanceof Error && e.message.startsWith("Could not find module")) {
+      const component = componentPath === "" ? "" : `${componentPath} `;
+      throw new Error(
+        `Attempted to schedule function at nonexistent path: ${component}${modulePath}.js`,
+        { cause: e },
+      );
+    }
+    throw e;
+  }
+  const func = module[exportName];
+  if (!func?.isQuery && !func?.isMutation && !func?.isAction) {
+    const inComponent = componentPath === "" ? "" : ` in '${componentPath}'`;
+    throw new Error(
+      `Attempted to schedule function, but no exported function ${exportName} ` +
+        `found in the file: ${modulePath}.js${inComponent}. Did you forget to export it?`,
+    );
+  }
 }
 
 function getFunctionPathFromAddress(

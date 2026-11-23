@@ -11,9 +11,17 @@ async function blockedScheduledFunction() {
   const loading = new Promise<void>((resolve) => {
     notifyLoading = resolve;
   });
+  // `runAfter` imports scheduler.ts to check that `add` exists, and the job
+  // imports it again when it runs. Let the first import resolve and hang the
+  // second, so the job stays stuck while it loads.
+  let targetChecked = false;
   const t = convexTest(schema, {
     ...modules,
     "./scheduler.ts": () => {
+      if (!targetChecked) {
+        targetChecked = true;
+        return import("./scheduler");
+      }
       notifyLoading();
       return new Promise<never>(() => {});
     },
