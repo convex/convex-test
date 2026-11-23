@@ -1365,6 +1365,7 @@ type ValidatorJSON =
     }
   | { type: "id"; tableName: string }
   | { type: "array"; value: ValidatorJSON }
+  | { type: "record"; keys: ValidatorJSON; values: ObjectFieldType }
   | { type: "object"; value: Record<string, ObjectFieldType> }
   | { type: "union"; value: ValidatorJSON[] };
 
@@ -1469,6 +1470,18 @@ function validateValidator(validator: ValidatorJSON, value: any) {
       }
       for (const v of value) {
         validateValidator(validator.value, v);
+      }
+      return;
+    }
+    case "record": {
+      if (value === null || !isSimpleObject(value)) {
+        throw new Error(
+          `Validator error: Expected a plain old JavaScript \`object\`, got \`${value}\``,
+        );
+      }
+      for (const [key, entry] of Object.entries(value)) {
+        validateValidator(validator.keys, key);
+        validateValidator(validator.values.fieldType, entry);
       }
       return;
     }
