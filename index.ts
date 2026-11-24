@@ -3094,9 +3094,13 @@ function moduleCache(specifiedModules?: Record<string, () => Promise<any>>) {
 }
 
 function findModulesRoot(modulesPaths: string[], userProvidedModules: boolean) {
-  const generatedFilePath = modulesPaths.find((path) =>
-    path.includes("_generated"),
-  );
+  // Local components can have their own `_generated` directories, so pick the
+  // shallowest one, which belongs to the app itself.
+  const depth = (path: string) =>
+    path.split("_generated", 1)[0].split("/").length;
+  const [generatedFilePath] = modulesPaths
+    .filter((path) => path.includes("_generated"))
+    .sort((a, b) => depth(a) - depth(b));
   if (generatedFilePath !== undefined) {
     return generatedFilePath.split("_generated", 2)[0];
   }
