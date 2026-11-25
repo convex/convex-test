@@ -4399,7 +4399,9 @@ function withAuth(
           )
             .invokeHttpAction(request)
             .catch((error: unknown) => {
-              const body: Record<string, unknown> = { code: "Server Error" };
+              const body: Record<string, unknown> = {
+                code: `[Request ID: ${requestMetadata.requestId}] Server Error: ${error instanceof Error ? error.message : String(error)}`,
+              };
               if (
                 error instanceof Error &&
                 Symbol.for("ConvexError") in error
