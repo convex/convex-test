@@ -69,11 +69,44 @@ const MAX_SEARCH_CANDIDATE_REVISIONS = 1024;
 // system fields, may be at most 1 MiB.
 const MAX_DOCUMENT_SIZE = 1 << 20;
 
+function checkDocumentShape(value: unknown, depth = 1): void {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    value instanceof ArrayBuffer ||
+    value instanceof CommitTsPlaceholder
+  )
+    return;
+  if (depth > 16)
+    throw new Error("Document is too nested (maximum nesting 16)");
+  if (Array.isArray(value)) {
+    if (value.length > 8192)
+      throw new Error("Array length is too long (maximum 8192)");
+    for (const item of value) checkDocumentShape(item, depth + 1);
+    return;
+  }
+  const keys = Object.keys(value);
+  if (keys.length > 1024)
+    throw new Error("Object has too many fields (maximum 1024)");
+  for (const key of keys) {
+    if (
+      depth === 1 &&
+      key.startsWith("_") &&
+      key !== "_id" &&
+      key !== "_creationTime"
+    ) {
+      throw new Error(`Field '${key}' starts with an underscore`);
+    }
+    checkDocumentShape((value as Record<string, unknown>)[key], depth + 1);
+  }
+}
+
 function checkDocumentSize(tableName: string, document: StoredDocument) {
   // System tables such as `_scheduled_functions` have their own limits.
   if (tableName.startsWith("_")) {
     return;
   }
+  checkDocumentShape(document);
   const size = getDocumentSize(document);
   if (size > MAX_DOCUMENT_SIZE) {
     throw new Error(
@@ -314,12 +347,21 @@ class DatabaseFake {
   }
 
   insert<Table extends TableName>(table: Table, value: any) {
-    this._validate(table, value);
+    if (!table.startsWith("_") && !isValidIdentifier(table))
+      throw new Error(`Table name ${table} contains an invalid character`);
     const _id = this._generateId(table);
     const now = Date.now();
     const _creationTime =
       now <= this._lastCreationTime ? this._lastCreationTime + 0.001 : now;
-    const document = { ...value, _id, _creationTime };
+    const { _id: suppliedId, _creationTime: suppliedTime, ...fields } = value;
+    if (suppliedId !== undefined && suppliedId !== _id)
+      throw new Error("Provided document ID doesn't match '_id' field");
+    if (suppliedTime !== undefined && suppliedTime !== _creationTime)
+      throw new Error(
+        "Provided creation time doesn't match '_creationTime' field",
+      );
+    this._validate(table, fields);
+    const document = { ...fields, _id, _creationTime };
     checkDocumentSize(table, document);
     this._lastCreationTime = _creationTime;
     this._addWrite(_id, document);
@@ -366,6 +408,8 @@ class DatabaseFake {
       convexValue[key] = evaluateValue(v);
     }
     const merged = { ...fields, ...convexValue };
+    for (const key of Object.keys(convexValue))
+      if (merged[key] === undefined) delete merged[key];
     const table = tableNameFromId(_id)!;
     this._validate(table, merged);
     const patched = { _id, _creationTime, ...merged };
@@ -539,7 +583,7 @@ class DatabaseFake {
     }
     // Validate the pre-commit view, like the backend does, so an unresolved
     // commit timestamp is checked as the int64 it will become.
-    validateValidator(validator, resolvePendingValues(doc));
+    validateValidator(validator, resolvePendingValues(doc), true);
   }
 
   startQuery(query: SerializedQuery) {
@@ -1435,7 +1479,11 @@ function formatLiteral(value: unknown) {
   return Object.is(value, -0) ? "-0" : `${value as any}`;
 }
 
-function validateValidator(validator: ValidatorJSON, value: any) {
+function validateValidator(
+  validator: ValidatorJSON,
+  value: any,
+  documentRoot = false,
+) {
   switch (validator.type) {
     case "null": {
       if (value !== null) {
@@ -1563,7 +1611,7 @@ function validateValidator(validator: ValidatorJSON, value: any) {
       let isValid = false;
       for (const v of validator.value) {
         try {
-          validateValidator(v, value);
+          validateValidator(v, value, documentRoot);
           isValid = true;
           break;
         } catch {
@@ -1591,6 +1639,7 @@ function validateValidator(validator: ValidatorJSON, value: any) {
       for (const [k, { fieldType, optional }] of Object.entries(
         validator.value,
       )) {
+        if (documentRoot && (k === "_id" || k === "_creationTime")) continue;
         if (value[k] === undefined) {
           if (!optional) {
             throw new Error(
@@ -1602,7 +1651,7 @@ function validateValidator(validator: ValidatorJSON, value: any) {
         }
       }
       for (const k of Object.keys(value)) {
-        if (validator.value[k] === undefined) {
+        if (!Object.prototype.hasOwnProperty.call(validator.value, k)) {
           throw new Error(
             `Validator error: Unexpected field \`${k}\` in object`,
           );
