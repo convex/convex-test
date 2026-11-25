@@ -1213,6 +1213,13 @@ function checkSearchCandidateLimit(source: Source, scanned: number) {
   }
 }
 
+function searchTokens(text: string) {
+  const tokens = text.match(/[\p{Alphabetic}\p{Number}]+/gu) ?? [];
+  return tokens
+    .filter((token) => new TextEncoder().encode(token).length < 32)
+    .map((token) => token.toLowerCase());
+}
+
 function evaluateSearchFilter(
   document: GenericDocument,
   filter: SerializedSearchFilter,
@@ -1225,15 +1232,12 @@ function evaluateSearchFilter(
       if (typeof result !== "string") {
         return false;
       }
-      const queryTerms = filter.value
-        .toLowerCase()
-        .split(/\s+/)
-        .filter((term) => term.length > 0);
-      const documentWords = result
-        .split(/\s+/)
-        .map((word) => word.toLowerCase());
-      return queryTerms.some((queryTerm) =>
-        documentWords.some((word) => word.startsWith(queryTerm)),
+      const queryTerms = searchTokens(filter.value).slice(0, 16);
+      const documentWords = searchTokens(result);
+      return queryTerms.some((term, i) =>
+        documentWords.some((word) =>
+          i === queryTerms.length - 1 ? word.startsWith(term) : word === term,
+        ),
       );
     }
   }
