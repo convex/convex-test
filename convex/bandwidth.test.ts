@@ -116,16 +116,119 @@ test("index range limit exceeded throws", async () => {
   });
   await t.run(async (ctx) => {
     await ctx.db.insert("messages", { author: "sarah", body: "hello" });
+    await ctx.db.insert("messages", { author: "sarah", body: "world" });
   });
   await expect(
     t.query(async (ctx) => {
-      // Each db.get counts as one index range read
+      // Each db.get of a different document counts as one index range read
       const docs = await ctx.db.query("messages").collect();
       await ctx.db.get(docs[0]._id);
-      await ctx.db.get(docs[0]._id);
+      await ctx.db.get(docs[1]._id);
       // The query itself used one range, plus two gets = 3 total, limit is 2
     }),
   ).rejects.toThrow(/Too many index ranges/);
+});
+
+test("reading the same document again does not count another index range", async () => {
+  const t = convexTest({ schema, transactionLimits: true });
+  const id = await t.run(async (ctx) => {
+    return await ctx.db.insert("messages", { author: "sarah", body: "hello" });
+  });
+  const metrics = await t.query(async (ctx) => {
+    // More gets than the 4,096 index range limit, all of the same document
+    for (let i = 0; i < 5000; i++) {
+      await ctx.db.get(id);
+    }
+    return await ctx.meta.getTransactionMetrics();
+  });
+  expect(metrics.databaseQueries.used).toBe(1);
+  // Every read still counts toward the document and byte limits
+  expect(metrics.documentsRead.used).toBe(5000);
+});
+
+test("running the same query again does not count another index range", async () => {
+  const t = convexTest({ schema, transactionLimits: true });
+  await t.run(async (ctx) => {
+    for (let i = 0; i < 3; i++) {
+      await ctx.db.insert("messages", { author: "sarah", body: `msg${i}` });
+    }
+  });
+  const used = await t.query(async (ctx) => {
+    for (let i = 0; i < 5000; i++) {
+      await ctx.db
+        .query("messages")
+        .withIndex("author", (q) => q.eq("author", "sarah"))
+        .first();
+    }
+    // Reading more or fewer rows reads part of the same range
+    await ctx.db
+      .query("messages")
+      .withIndex("author", (q) => q.eq("author", "sarah"))
+      .collect();
+    await ctx.db
+      .query("messages")
+      .withIndex("author", (q) => q.eq("author", "sarah"))
+      .take(2);
+    return (await ctx.meta.getTransactionMetrics()).databaseQueries.used;
+  });
+  expect(used).toBe(1);
+});
+
+test("different index ranges each count once", async () => {
+  const t = convexTest({ schema, transactionLimits: true });
+  await t.run(async (ctx) => {
+    await ctx.db.insert("messages", { author: "sarah", body: "a" });
+    await ctx.db.insert("messages", { author: "michal", body: "b" });
+  });
+  const used = await t.query(async (ctx) => {
+    for (const author of ["sarah", "michal", "sarah", "michal"]) {
+      await ctx.db
+        .query("messages")
+        .withIndex("author", (q) => q.eq("author", author))
+        .first();
+    }
+    // The first and last rows of a table are different ranges
+    await ctx.db.query("messages").order("asc").first();
+    await ctx.db.query("messages").order("desc").first();
+    return (await ctx.meta.getTransactionMetrics()).databaseQueries.used;
+  });
+  expect(used).toBe(4);
+});
+
+test("a page counts the range it starts, once", async () => {
+  const t = convexTest({ schema, transactionLimits: true });
+  await t.run(async (ctx) => {
+    for (let i = 0; i < 3; i++) {
+      await ctx.db.insert("messages", { author: "sarah", body: `msg${i}` });
+    }
+  });
+  const used = await t.mutation(async (ctx) => {
+    // A stream and a first page start at the same place
+    await ctx.db.query("messages").first();
+    const first = await ctx.db
+      .query("messages")
+      .paginate({ cursor: null, numItems: 1 });
+    await ctx.db.query("messages").paginate({ cursor: null, numItems: 2 });
+    await ctx.db
+      .query("messages")
+      .paginate({ cursor: first.continueCursor, numItems: 1 });
+    return (await ctx.meta.getTransactionMetrics()).databaseQueries.used;
+  });
+  expect(used).toBe(2);
+});
+
+test("each transaction starts with no index ranges read", async () => {
+  const t = convexTest({ schema, transactionLimits: true });
+  const id = await t.run(async (ctx) => {
+    return await ctx.db.insert("messages", { author: "sarah", body: "hello" });
+  });
+  for (let i = 0; i < 2; i++) {
+    const used = await t.query(async (ctx) => {
+      await ctx.db.get(id);
+      return (await ctx.meta.getTransactionMetrics()).databaseQueries.used;
+    });
+    expect(used).toBe(1);
+  }
 });
 
 test("limits accumulate within a transaction", async () => {

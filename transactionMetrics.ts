@@ -82,6 +82,7 @@ type MetricsLayer = {
 export class TransactionMetricsTracker {
   private _config: Partial<TransactionMetrics> | boolean;
   private _layers: MetricsLayer[] = [];
+  private _rangesRead = new Set<string>();
 
   constructor(config: Partial<TransactionMetrics> | boolean = false) {
     this._config = config;
@@ -168,11 +169,20 @@ export class TransactionMetricsTracker {
     }
   }
 
-  trackIndexRange() {
+  // The backend counts the transaction's read set, not calls: it charges an
+  // index range once, however often it is read, and nested calls and rolled
+  // back ones share the read set. `rangeKey` identifies the range; reading it
+  // again costs nothing. The backend also merges overlapping ranges, which
+  // this does not, so the count can only be higher than the backend's.
+  trackIndexRange(rangeKey: string) {
     const layer = this._current();
     if (layer === undefined) {
       return;
     }
+    if (this._rangesRead.has(rangeKey)) {
+      return;
+    }
+    this._rangesRead.add(rangeKey);
     layer.metrics.databaseQueries += 1;
     if (layer.enforce) {
       if (layer.metrics.databaseQueries > layer.limits.databaseQueries) {

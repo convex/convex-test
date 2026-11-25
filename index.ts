@@ -1613,6 +1613,18 @@ function validateValidator(validator: ValidatorJSON, value: any) {
   }
 }
 
+// A query's index range depends only on its source and where it starts: the
+// backend records the span a query actually read, so a filter, a `take` or
+// `first`, or a later page size reads a part of the same range. Queries that
+// start at the same cursor share a key.
+function queryRangeKey(
+  componentPath: string,
+  query: SerializedQuery,
+  cursor: string | null,
+) {
+  return `${componentPath}:range:${JSON.stringify(query.source)}:${cursor}`;
+}
+
 function syscallImpl() {
   return (op: string, jsonArgs: string) => {
     const args = JSON.parse(jsonArgs);
@@ -1626,7 +1638,7 @@ function syscallImpl() {
       case "1.0/queryStream": {
         const { query } = args;
         const tracker = getTransactionManager().getMetricsTracker();
-        tracker?.trackIndexRange();
+        tracker?.trackIndexRange(queryRangeKey(db.componentPath, query, null));
         const queryId = db.startQuery(query);
         return JSON.stringify({ queryId });
       }
@@ -2022,7 +2034,7 @@ function asyncSyscallImpl() {
     switch (op) {
       case "1.0/get": {
         const { table, id } = args;
-        tracker?.trackIndexRange();
+        tracker?.trackIndexRange(`${db.componentPath}:get:${id}`);
         const doc = getAndTrack(table, id);
         return JSON.stringify(convexToJson(doc));
       }
@@ -2053,7 +2065,9 @@ function asyncSyscallImpl() {
             );
           }
         }
-        tracker?.trackIndexRange();
+        tracker?.trackIndexRange(
+          queryRangeKey(db.componentPath, query, cursor ?? null),
+        );
         const { page, isDone, continueCursor, splitCursor, pageStatus } =
           db.paginate({
             query,

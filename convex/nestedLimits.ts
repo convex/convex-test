@@ -137,3 +137,12 @@ export const nestThenReadAll = query({
     return docs.length;
   },
 });
+
+// Parent query that reads every message, has a nested query read them again,
+// then reports how many index ranges the transaction has read.
+export const readAllTwiceThenReportQueries = query(async (ctx) => {
+  await ctx.db.query("messages").collect();
+  await ctx.runQuery(api.nestedLimits.readAll, {});
+  const metrics = await ctx.meta.getTransactionMetrics();
+  return metrics.databaseQueries.used;
+});
