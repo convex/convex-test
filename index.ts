@@ -4417,7 +4417,11 @@ function withAuth(
         throw new Error(`Path given to \`t.fetch\` must start with a \`/\``);
       }
       const url = new URL(`https://some.convex.site${path}`);
-      const found = router.lookup(url.pathname, init?.method ?? ("GET" as any));
+      const request = new Request(url, init);
+      const found = router.lookup(
+        url.pathname,
+        request.method.toUpperCase() as Parameters<HttpRouter["lookup"]>[1],
+      );
       if (!found) {
         return new Response(`No HttpAction routed for ${url.pathname}`, {
           status: 404,
@@ -4449,7 +4453,23 @@ function withAuth(
             a as unknown as {
               invokeHttpAction: (request: Request) => Promise<Response>;
             }
-          ).invokeHttpAction(new Request(url, init)),
+          )
+            .invokeHttpAction(request)
+            .catch((error: unknown) => {
+              const body: Record<string, unknown> = {
+                code: `[Request ID: ${requestContext.metadata.requestId}] Server Error: ${error instanceof Error ? error.message : String(error)}`,
+              };
+              if (
+                error instanceof Error &&
+                Symbol.for("ConvexError") in error
+              ) {
+                const decoded = deserializeConvexErrorData(error) as Error & {
+                  data: Value;
+                };
+                body.data = convexToJson(decoded.data);
+              }
+              return Response.json(body, { status: 500 });
+            }),
         ),
       );
       return response;

@@ -57,8 +57,8 @@ test("HTTP global patches do not leak after a handler throws", async () => {
   const t = convexTest(schema);
   const originalAtob = globalThis.atob;
   try {
-    await expect(t.fetch("/globals?patch=patched-error&throw")).rejects.toThrow(
-      "HTTP handler failed after patching globals",
+    expect((await t.fetch("/globals?patch=patched-error&throw")).status).toBe(
+      500,
     );
     expect(globalThis.atob).toBe(originalAtob);
     expect(await (await t.fetch("/globals")).text()).toBe("hello");
