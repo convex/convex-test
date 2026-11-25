@@ -1883,7 +1883,9 @@ function deploymentJwtIssuer(componentPath: string) {
 
 function getDeploymentJwtKey() {
   const convex = getConvexGlobal();
-  convex.deploymentJwtKey ??= generateDeploymentJwtKey();
+  convex.deploymentJwtKey ??= globalOverridesStorage.exit(
+    generateDeploymentJwtKey,
+  );
   return convex.deploymentJwtKey;
 }
 
@@ -2495,7 +2497,9 @@ function asyncSyscallImpl() {
         if (udfType !== "mutation") {
           throw new Error(`Unknown async operation ${op}`);
         }
-        return JSON.stringify(await signDeploymentJwt(args));
+        return JSON.stringify(
+          await globalOverridesStorage.exit(() => signDeploymentJwt(args)),
+        );
       }
       case "1.0/getDeploymentJwks": {
         // Allowed everywhere: the keys are deployment state, not a fresh
@@ -3002,6 +3006,7 @@ export type TestConvexRoot<DataModel extends GenericDataModel> = {
     componentPath: string,
     schema: SchemaDefinition<GenericSchema, boolean>,
     glob: Record<string, () => Promise<any>>,
+    options?: { env?: Record<string, string> },
   ) => ComponentApi;
 } & TestConvexForDataModel<DataModel>;
 
@@ -3114,6 +3119,7 @@ function findModulesRoot(modulesPaths: string[], userProvidedModules: boolean) {
 }
 
 type ComponentInfo = {
+  env?: Record<string, string>;
   db: DatabaseFake;
   modules: ReturnType<typeof moduleCache>;
 };
@@ -3288,6 +3294,44 @@ function disallowedInTransaction(name: string): (...args: unknown[]) => never {
   };
 }
 
+function transactionCrypto() {
+  const base = globalOverridesStorage.exit(() => globalThis.crypto);
+  if (!base?.subtle) return base;
+  const subtle = new Proxy(base.subtle, {
+    get(target, property) {
+      const method = Reflect.get(target, property, target);
+      if (
+        property === "generateKey" ||
+        property === "encrypt" ||
+        property === "sign"
+      ) {
+        return async (algorithm: AlgorithmIdentifier, ...args: unknown[]) => {
+          const name = (
+            typeof algorithm === "string" ? algorithm : algorithm.name
+          ).toUpperCase();
+          if (
+            property === "generateKey" ||
+            (property === "encrypt" && name === "RSA-OAEP") ||
+            (property === "sign" && (name === "ECDSA" || name === "RSA-PSS"))
+          ) {
+            throw new Error(
+              "Can't use cryptographic randomness in queries and mutations",
+            );
+          }
+          return Reflect.apply(method, target, [algorithm, ...args]);
+        };
+      }
+      return typeof method === "function" ? method.bind(target) : method;
+    },
+  });
+  return new Proxy(base, {
+    get(target, property) {
+      if (property === "subtle") return subtle;
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
 function transactionGlobalOverrides(): GlobalOverrides {
   const BaseDate = globalOverridesStorage.exit(() => Date);
   const time = getTransactionManager().getTime();
@@ -3310,9 +3354,10 @@ function transactionGlobalOverrides(): GlobalOverrides {
         return new BaseDate(time).toString();
       },
     }),
-    fetch: disallowedInTransaction("fetch"),
+    fetch: async () => disallowedInTransaction("fetch")(),
+    crypto: transactionCrypto(),
     setTimeout: disallowedInTransaction("setTimeout"),
-    clearTimeout: disallowedInTransaction("clearTimeout"),
+    clearTimeout: () => {},
     setInterval: disallowedInTransaction("setInterval"),
     clearInterval: disallowedInTransaction("clearInterval"),
   };
@@ -3405,7 +3450,74 @@ function runWithGlobalOverrides<T>(
   handler: () => T,
 ) {
   installGlobalProxies();
-  return globalOverridesStorage.run(overrides, handler);
+  return globalOverridesStorage.exit(() => {
+    const host = typeof process === "undefined" ? {} : process.env;
+    const path = getCurrentComponentPath();
+    const component = getComponentInfo(path);
+    const env = new Proxy(
+      {},
+      {
+        get(_, key) {
+          if (typeof key !== "string") return undefined;
+          if (key === "CONVEX_CLOUD_URL")
+            return host[key] ?? DEFAULT_CONVEX_CLOUD_URL;
+          if (key === "CONVEX_SITE_URL")
+            return host[key] ?? "https://some.convex.site";
+          return path === ROOT_COMPONENT_PATH
+            ? host[key]
+            : component.env?.[key];
+        },
+      },
+    );
+    // Node's fetch implementation schedules body streams with queueMicrotask.
+    // Let host constructors and their static factories use the host scheduler.
+    function hostWebConstructor<T extends typeof Request | typeof Response>(
+      ctor: T,
+    ) {
+      return new Proxy(ctor, {
+        construct(target, args, newTarget) {
+          return globalOverridesStorage.exit(() =>
+            Reflect.construct(target, args, newTarget),
+          );
+        },
+        get(target, key, receiver) {
+          const member = Reflect.get(target, key, receiver);
+          if (typeof member !== "function" || !Object.hasOwn(target, key))
+            return member;
+          return (...args: unknown[]) =>
+            globalOverridesStorage.exit(() =>
+              Reflect.apply(member, target, args),
+            );
+        },
+      });
+    }
+    const runtimeConsole = Object.fromEntries(
+      (
+        [
+          "log",
+          "debug",
+          "info",
+          "warn",
+          "error",
+          "trace",
+          "time",
+          "timeLog",
+          "timeEnd",
+        ] as const
+      ).map((key) => [key, console[key]?.bind(console)]),
+    );
+    return globalOverridesStorage.run(
+      {
+        process: { env },
+        console: runtimeConsole,
+        queueMicrotask: undefined,
+        Request: hostWebConstructor(Request),
+        Response: hostWebConstructor(Response),
+        ...overrides,
+      },
+      handler,
+    );
+  });
 }
 
 // Install a permanent global proxy so the Convex runtime's
@@ -3778,10 +3890,12 @@ function createConvexTest<SchemaDef extends SchemaDefinition<any, boolean>>(
     componentPath: string,
     schema: SchemaDefinition<GenericSchema, boolean>,
     glob: Record<string, () => Promise<any>>,
+    options?: { env?: Record<string, string> },
   ) {
     const componentInfo = {
       db: new DatabaseFake(schema, componentPath),
       modules: moduleCache(glob),
+      env: options?.env,
     };
     convexGlobal.components[componentPath] = componentInfo;
     return componentsGeneric()[componentPath] as unknown as ComponentApi;
