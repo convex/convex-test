@@ -757,6 +757,12 @@ class DatabaseFake {
     };
   }
 
+  count(table: string) {
+    let count = 0;
+    this._iterateDocs(table, () => count++);
+    return count;
+  }
+
   private _iterateDocs(
     tableName: string,
     callback: (doc: GenericDocument) => void,
@@ -2441,20 +2447,7 @@ function asyncSyscallImpl() {
       }
       case "1.0/count": {
         const { table } = args;
-        const queryId = db.startQuery({
-          source: { type: "FullTableScan", tableName: table, order: "asc" },
-          operators: [],
-        });
-        let count = 0;
-
-        while (true) {
-          const result = db.queryNext(queryId);
-          if (result.done) {
-            break;
-          }
-          count += 1;
-        }
-        return JSON.stringify(count);
+        return JSON.stringify(db.count(table));
       }
       case "1.0/auditLog": {
         return JSON.stringify(null);
