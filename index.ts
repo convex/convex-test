@@ -4457,7 +4457,7 @@ function withAuth(
             .invokeHttpAction(request)
             .catch((error: unknown) => {
               const body: Record<string, unknown> = {
-                code: `[Request ID: ${requestMetadata.requestId}] Server Error: ${error instanceof Error ? error.message : String(error)}`,
+                code: `[Request ID: ${requestContext.metadata.requestId}] Server Error: ${error instanceof Error ? error.message : String(error)}`,
               };
               if (
                 error instanceof Error &&
