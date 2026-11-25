@@ -2372,6 +2372,19 @@ function asyncSyscallImpl() {
         });
         return JSON.stringify({});
       }
+      case "1.0/storageGetMetadata": {
+        const doc = db.get("_storage", args.storageId);
+        if (!doc) return JSON.stringify(null);
+        const digest = Base64.toByteArray(doc.sha256 as string);
+        return JSON.stringify({
+          storageId: args.storageId,
+          size: doc.size,
+          contentType: doc.contentType ?? null,
+          sha256: Array.from(digest, (byte) =>
+            byte.toString(16).padStart(2, "0"),
+          ).join(""),
+        });
+      }
       case "1.0/storageGetUrl": {
         const { storageId } = args;
         const metadata = db.get("_storage", storageId);
@@ -2516,11 +2529,20 @@ function jsSyscallImpl() {
     const db = getDb();
     switch (op) {
       case "storage/storeBlob": {
-        const { blob } = args as { blob: Blob };
+        const { blob, options } = args as {
+          blob: Blob;
+          options?: { sha256?: string };
+        };
+        const sha256 = await blobSha(blob);
+        if (options?.sha256 !== undefined && options.sha256 !== sha256) {
+          throw new Error(
+            `Sha256 mismatch. Expected: ${options.sha256} Actual: ${sha256}`,
+          );
+        }
         return await writeToDatabase(async (db) => {
           const storageId = db.insert("_storage", {
             size: blob.size,
-            sha256: await blobSha(blob),
+            sha256,
             ...(blob.type ? { contentType: blob.type } : {}),
           });
           db.storeFile(storageId, blob);
