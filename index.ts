@@ -445,6 +445,13 @@ class DatabaseFake {
       );
     }
 
+    const actualTableName = tableNameFromId(id);
+    if (actualTableName === null) {
+      throw new Error(
+        `Invalid argument \`id\`, Unable to decode ID, got '${id}'`,
+      );
+    }
+
     if (expectedTableName === undefined) {
       return;
     }
@@ -452,13 +459,6 @@ class DatabaseFake {
     if (typeof expectedTableName !== "string") {
       throw new Error(
         `Invalid argument \`tableName\`, expected string but got '${typeof expectedTableName}': ${expectedTableName as any}`,
-      );
-    }
-
-    const actualTableName = tableNameFromId(id);
-    if (actualTableName === null) {
-      throw new Error(
-        `Invalid argument \`id\`, expected ID value but got '${id}'`,
       );
     }
 
@@ -2012,6 +2012,15 @@ function asyncSyscallImpl() {
     const args = JSON.parse(jsonArgs);
     const db = getDb();
     const tracker = getTransactionManager().getMetricsTracker();
+    function checkTableAccess(table: string | null, system = false) {
+      if (table !== null && table.startsWith("_") !== system) {
+        throw new Error(
+          system
+            ? "User tables cannot be accessed with db.system"
+            : "System tables can only be accessed with db.system",
+        );
+      }
+    }
     function getAndTrack(table: string, id: GenericId<string>) {
       const doc = db.get(table, id);
       if (doc !== null) {
@@ -2023,6 +2032,7 @@ function asyncSyscallImpl() {
       case "1.0/get": {
         const { table, id } = args;
         tracker?.trackIndexRange();
+        checkTableAccess(tableNameFromId(id), args.isSystem);
         const doc = getAndTrack(table, id);
         return JSON.stringify(convexToJson(doc));
       }
@@ -2076,6 +2086,7 @@ function asyncSyscallImpl() {
         );
       }
       case "1.0/insert": {
+        checkTableAccess(args.table);
         const _id = db.insert(args.table, jsonToConvex(args.value));
         tracker?.trackWrite(getConvexSize(db.get(args.table, _id)));
         return JSON.stringify({ _id });
@@ -2083,6 +2094,7 @@ function asyncSyscallImpl() {
       case "1.0/shallowMerge": {
         const { table, id, value } = args;
         getAndTrack(table, id);
+        checkTableAccess(tableNameFromId(id));
         db.patch(table, id, value);
         tracker?.trackWrite(getConvexSize(db.get(table, id)));
         return JSON.stringify({});
@@ -2090,6 +2102,7 @@ function asyncSyscallImpl() {
       case "1.0/replace": {
         const { table, id, value } = args;
         getAndTrack(table, id);
+        checkTableAccess(tableNameFromId(id));
         db.replace(table, id, value);
         tracker?.trackWrite(getConvexSize(db.get(table, id)));
         return JSON.stringify({});
@@ -2097,6 +2110,7 @@ function asyncSyscallImpl() {
       case "1.0/remove": {
         const { table, id } = args;
         getAndTrack(table, id);
+        checkTableAccess(tableNameFromId(id));
         db.delete(table, id);
         tracker?.trackWrite(0);
         return JSON.stringify({});
