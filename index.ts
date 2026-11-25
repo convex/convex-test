@@ -904,6 +904,9 @@ class DatabaseFake {
         checkSearchCandidateLimit(query.source, scanned);
         if (scanned === sortedDocs.length) return;
         const doc = sortedDocs[scanned++];
+        getTransactionManager()
+          .getMetricsTracker()
+          ?.trackRead(getDocumentSize(doc));
         if (filterFn(doc)) {
           returned++;
           yield doc;
@@ -2028,9 +2031,7 @@ function asyncSyscallImpl() {
       }
       case "1.0/queryStreamNext": {
         const { value, done } = db.queryNext(args.queryId);
-        if (!done && value !== null) {
-          tracker?.trackRead(getDocumentSize(value));
-        }
+
         return JSON.stringify(convexToJson({ value, done }));
       }
       case "1.0/queryPage": {
@@ -2179,6 +2180,11 @@ function asyncSyscallImpl() {
         );
       }
       case "1.0/runUdf": {
+        if (
+          (executionContextStorage.getStore()?.transactionCallDepth ?? 0) >= 8
+        ) {
+          throw new Error("Cross component call depth limit exceeded");
+        }
         const {
           udfType,
           name,
@@ -3128,6 +3134,7 @@ type FunctionPath = {
 type UdfType = "query" | "mutation" | "action" | "http";
 
 type ExecutionContext = {
+  transactionCallDepth?: number;
   componentPath: string;
   udfPath: string;
   udfType: UdfType;
@@ -3890,6 +3897,9 @@ function withAuth(
       componentPath: functionPath.componentPath,
       udfPath: functionPath.udfPath,
       udfType: "mutation",
+      transactionCallDepth: isNested
+        ? (parentCtx?.transactionCallDepth ?? 0) + 1
+        : 0,
       depth: (parentCtx?.depth ?? 0) + 1,
     };
     const requestMetadata = requestMetadataForExecution();
@@ -3959,6 +3969,9 @@ function withAuth(
       componentPath: functionPath.componentPath,
       udfPath: functionPath.udfPath,
       udfType: "query",
+      transactionCallDepth: isNested
+        ? (parentCtx?.transactionCallDepth ?? 0) + 1
+        : 0,
       depth: (parentCtx?.depth ?? 0) + 1,
       pagination: (isNested && parentCtx?.pagination) || { calls: 0 },
     };
