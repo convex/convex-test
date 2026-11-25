@@ -1994,7 +1994,10 @@ async function runScheduledFunction({
             return;
           }
           db.patch("_scheduled_functions", jobId, {
-            state: { kind: "failed" },
+            state: {
+              kind: "failed",
+              error: `Uncaught ${error instanceof Error ? error.toString() : String(error)}`,
+            },
             completedTime: Date.now(),
           });
         });
@@ -2012,6 +2015,7 @@ async function runScheduledFunction({
         }
         db.patch("_scheduled_functions", jobId, {
           state: { kind: "success" },
+          completedTime: Date.now(),
         });
       });
     }),
@@ -2303,6 +2307,15 @@ function asyncSyscallImpl() {
 
         tracker?.trackScheduledFunction(getConvexSize(parsedArgs));
 
+        if (!Number.isFinite(tsInSecs))
+          throw new Error("Invalid arguments for `scheduler`");
+        const delta = tsInSecs - Date.now() / 1000;
+        if (Math.abs(delta) > 5 * 366 * 24 * 3600)
+          throw new Error(
+            `Scheduled time is more than 5 years in the ${delta > 0 ? "future" : "past"}`,
+          );
+        const [modulePath, exportName = "default"] =
+          functionPath.udfPath.split(":");
         // IDs can collide between component databases, so look up the parent
         // in the component that owns its scheduled-function document.
         const requestContext = requestContextStorage.getStore();
@@ -2320,7 +2333,7 @@ function asyncSyscallImpl() {
         const scheduledTime = canceled ? Date.now() : tsInSecs * 1000;
         const jobId = db.insert("_scheduled_functions", {
           args: [parsedArgs],
-          name: functionPath.udfPath,
+          name: `${modulePath.replace(/\.js$/, "")}.js:${exportName}`,
           scheduledTime,
           state: { kind: canceled ? "canceled" : "pending" },
           ...(canceled ? { completedTime: scheduledTime } : {}),
@@ -4401,7 +4414,7 @@ function withAuth(
     fun: async (functionPath: FunctionPath, args: any) => {
       const { func } = await resolveFunction(functionPath, "any");
       if (func.isQuery) {
-        return await byTypeWithPath.queryFromPath(functionPath, args);
+        throw new Error("Only mutations and actions can be scheduled");
       }
       if (func.isMutation) {
         return await byTypeWithPath.mutationFromPath(functionPath, args);

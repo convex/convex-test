@@ -148,7 +148,7 @@ async function start(
 function expectChildrenCanceled(
   jobs: DocumentByName<SystemDataModel, "_scheduled_functions">[],
 ) {
-  const children = jobs.filter((job) => job.name === "probe:child");
+  const children = jobs.filter((job) => job.name === "probe.js:child");
   expect(
     children.map((job) => ({ label: job.args[0], state: job.state.kind })),
   ).toEqual([
@@ -218,7 +218,7 @@ test("uncanceled scheduled actions and ordinary actions can schedule normally", 
   const jobs = await t.query(fixture.internal.probe.jobs);
   expect(
     jobs
-      .filter((job: { name: string }) => job.name === "probe:child")
+      .filter((job: { name: string }) => job.name === "probe.js:child")
       .every(
         (job: { state: { kind: string } }) => job.state.kind === "pending",
       ),
