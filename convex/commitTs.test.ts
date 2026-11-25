@@ -138,7 +138,9 @@ test("paginating over rows staged in the writing mutation", async () => {
   expect(result.isDone).toBe(false);
   // The cursor's leading key is the indexed `commitTs` field, encoded from the
   // pre-commit view rather than from the placeholder.
-  const [commitTsKey] = JSON.parse(result.continueCursor) as string[];
+  const [commitTsKey] = JSON.parse(
+    JSON.parse(result.continueCursor).position,
+  ) as string[];
   expect(JSON.parse(commitTsKey)).toEqual(convexToJson(2n ** 63n - 1n));
 });
 

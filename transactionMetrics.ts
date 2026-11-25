@@ -79,6 +79,8 @@ type MetricsLayer = {
  * usage folds back into its parent; on rollback only the reads fold back,
  * since the writes were undone.
  */
+export class PaginationReadLimitError extends Error {}
+
 export class TransactionMetricsTracker {
   private _config: Partial<TransactionMetrics> | boolean;
   private _layers: MetricsLayer[] = [];
@@ -131,13 +133,13 @@ export class TransactionMetricsTracker {
     layer.metrics.documentsRead += 1;
     if (layer.enforce) {
       if (layer.metrics.bytesRead > layer.limits.bytesRead) {
-        throw new Error(
+        throw new PaginationReadLimitError(
           `Read too much data in a single function execution (limit: ${layer.limits.bytesRead} bytes). ` +
             `This is a Convex limit: https://docs.convex.dev/production/state/limits`,
         );
       }
       if (layer.metrics.documentsRead > layer.limits.documentsRead) {
-        throw new Error(
+        throw new PaginationReadLimitError(
           `Scanned too many documents in a single function execution (limit: ${layer.limits.documentsRead}). ` +
             `This is a Convex limit: https://docs.convex.dev/production/state/limits`,
         );
