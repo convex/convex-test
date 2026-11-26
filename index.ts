@@ -939,16 +939,21 @@ class DatabaseFake {
       throw new Error(
         `Expected a vector with dimensions ${vectorIndex.dimensions}, received ${vector.length}`,
       );
-    function validateFilter(filter: VectorFilter) {
+    function collectEqualities(
+      filter: VectorFilter,
+    ): Exclude<VectorFilter, { $or: VectorFilter[] }>[] {
       if ("$or" in filter) {
-        filter.$or.forEach(validateFilter);
-        return;
+        return filter.$or.flatMap(collectEqualities);
       }
       const field = filter.$eq[0].$field;
       if (!vectorIndex!.filterFields.includes(field))
         throw new Error(`Field ${field} isn't indexed for filtering`);
+      return [filter];
     }
-    expressions.forEach(validateFilter);
+    // An empty disjunction contributes no filter conditions to the index.
+    const conditions = expressions
+      .map(collectEqualities)
+      .filter((terms) => terms.length > 0);
     const idsAndScores: { _id: Value; _score: number }[] = [];
     this._iterateDocs(tableName, (doc) => {
       const stored = evaluateFieldPath(vectorIndex.vectorField, doc);
@@ -956,7 +961,9 @@ class DatabaseFake {
         Array.isArray(stored) &&
         stored.length === vector.length &&
         stored.every((n) => typeof n === "number") &&
-        expressions.every((f) => evaluateFilter(doc, f))
+        conditions.every((terms) =>
+          terms.some((term) => evaluateFilter(doc, term)),
+        )
       ) {
         idsAndScores.push({
           _id: doc._id,

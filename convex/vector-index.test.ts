@@ -36,6 +36,31 @@ test("vector: the default limit is 10", async () => {
   expect(results.length).toBe(10);
 });
 
+test("empty vector disjunctions preserve the unfiltered top ten", async () => {
+  const t = await setup(
+    Array.from({ length: 12 }, (_, i) => ({
+      orgId: String(i),
+      embedding: [1, i],
+    })),
+  );
+  await t.action(async (ctx) => {
+    const search = { vector: [1, 0] };
+    const expected = await ctx.vectorSearch("chunks", "by_embedding", search);
+    expect(expected).toHaveLength(10);
+    expect(
+      await ctx.vectorSearch("chunks", "by_embedding", {
+        ...search,
+        filter: (q) => q.or(),
+      }),
+    ).toEqual(expected);
+    const one = await ctx.vectorSearch("chunks", "by_embedding", {
+      ...search,
+      filter: (q) => q.or(q.or(), q.eq("orgId", "0")),
+    });
+    expect(one).toEqual(expected.slice(0, 1));
+  });
+});
+
 test("vector: limit is capped at 256", async () => {
   const t = await setup([{ orgId: "a", embedding: [1, 0] }]);
   await expect(
