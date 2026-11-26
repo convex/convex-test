@@ -2414,7 +2414,7 @@ function asyncSyscallImpl() {
           const storageId = db.insert("_storage", {
             size: bytes.length,
             sha256,
-            ...(type !== undefined ? { contentType: type } : {}),
+            contentType: type ?? null,
           });
           db.storeFile(storageId, file);
           return storageId;
@@ -2543,7 +2543,7 @@ function jsSyscallImpl() {
           const storageId = db.insert("_storage", {
             size: blob.size,
             sha256,
-            ...(blob.type ? { contentType: blob.type } : {}),
+            contentType: blob.type || null,
           });
           db.storeFile(storageId, blob);
           return storageId;

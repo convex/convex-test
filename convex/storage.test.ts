@@ -64,7 +64,7 @@ test.each(["action", "run"] as const)(
 );
 
 test.each([undefined, ""])(
-  "store blob omits content type when Blob type is %s",
+  "store blob records null content type when Blob type is %s",
   async (type) => {
     const t = convexTest(schema);
     const storageId = await t.action(async (ctx) => {
@@ -74,7 +74,7 @@ test.each([undefined, ""])(
       return await ctx.db.system.get("_storage", storageId);
     });
     expect(metadata).toMatchObject({ _id: storageId, size: 6 });
-    expect(metadata).not.toHaveProperty("contentType");
+    expect(metadata).toHaveProperty("contentType", null);
   },
 );
 
@@ -163,6 +163,17 @@ test("mutation store blob", async () => {
       contentType: "text/plain",
     },
   ]);
+});
+
+test("mutation store records null when no content type is supplied", async () => {
+  const t = convexTest(schema);
+  const id = await t.mutation(async (ctx) =>
+    ctx.storage.store(new Blob(["sample"])),
+  );
+  const metadata = await t.query(async (ctx) =>
+    ctx.db.system.get("_storage", id),
+  );
+  expect(metadata).toHaveProperty("contentType", null);
 });
 
 test("mutation store blob with matching sha256", async () => {
