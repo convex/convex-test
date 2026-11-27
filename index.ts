@@ -138,6 +138,9 @@ type Index = {
   fields: string[];
 };
 
+type VectorFilter =
+  { $or: VectorFilter[] } | { $eq: [{ $field: string }, unknown] };
+
 type VectorIndex = {
   indexDescriptor: string;
   vectorField: string;
@@ -915,16 +918,10 @@ class DatabaseFake {
   vectorSearch(
     tableAndIndexName: string,
     vector: number[],
-    expressions: SerializedRangeExpression[],
-    limit: number,
+    expressions: VectorFilter[],
+    limit = 10,
   ) {
-    const results: GenericDocument[] = [];
     const [tableName, indexName] = tableAndIndexName.split(".");
-    this._iterateDocs(tableName, (doc) => {
-      if (expressions.every((filter) => evaluateFilter(doc, filter))) {
-        results.push(doc);
-      }
-    });
     const vectorIndexes = this._schema?.tables.get(tableName)?.vectorIndexes;
     const vectorIndex = vectorIndexes?.find(
       ({ indexDescriptor }: { indexDescriptor: string }) =>
@@ -936,10 +933,43 @@ class DatabaseFake {
           `it is not declared in the schema.`,
       );
     }
-    const { vectorField } = vectorIndex;
-    const idsAndScores = results.map((doc) => {
-      const score = cosineSimilarity(vector, doc[vectorField] as number[]);
-      return { _id: doc._id, _score: score };
+    if (!Number.isInteger(limit) || limit < 0 || limit > 256)
+      throw new Error("Vector queries can fetch at most 256 results");
+    if (vector.length !== vectorIndex.dimensions)
+      throw new Error(
+        `Expected a vector with dimensions ${vectorIndex.dimensions}, received ${vector.length}`,
+      );
+    function collectEqualities(
+      filter: VectorFilter,
+    ): Exclude<VectorFilter, { $or: VectorFilter[] }>[] {
+      if ("$or" in filter) {
+        return filter.$or.flatMap(collectEqualities);
+      }
+      const field = filter.$eq[0].$field;
+      if (!vectorIndex!.filterFields.includes(field))
+        throw new Error(`Field ${field} isn't indexed for filtering`);
+      return [filter];
+    }
+    // An empty disjunction contributes no filter conditions to the index.
+    const conditions = expressions
+      .map(collectEqualities)
+      .filter((terms) => terms.length > 0);
+    const idsAndScores: { _id: Value; _score: number }[] = [];
+    this._iterateDocs(tableName, (doc) => {
+      const stored = evaluateFieldPath(vectorIndex.vectorField, doc);
+      if (
+        Array.isArray(stored) &&
+        stored.length === vector.length &&
+        stored.every((n) => typeof n === "number") &&
+        conditions.every((terms) =>
+          terms.some((term) => evaluateFilter(doc, term)),
+        )
+      ) {
+        idsAndScores.push({
+          _id: doc._id,
+          _score: cosineSimilarity(vector, stored),
+        });
+      }
     });
     idsAndScores.sort((a, b) => b._score - a._score);
     return idsAndScores.slice(0, limit);

@@ -38,6 +38,6 @@ export default defineSchema({
     .vectorIndex("embedding", {
       vectorField: "embedding",
       filterFields: ["author", "body"],
-      dimensions: 1536,
+      dimensions: 3,
     }),
 });
