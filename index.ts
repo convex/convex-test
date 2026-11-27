@@ -757,6 +757,12 @@ class DatabaseFake {
     };
   }
 
+  count(table: string) {
+    let count = 0;
+    this._iterateDocs(table, () => count++);
+    return count;
+  }
+
   private _iterateDocs(
     tableName: string,
     callback: (doc: GenericDocument) => void,
@@ -904,6 +910,9 @@ class DatabaseFake {
         checkSearchCandidateLimit(query.source, scanned);
         if (scanned === sortedDocs.length) return;
         const doc = sortedDocs[scanned++];
+        getTransactionManager()
+          .getMetricsTracker()
+          ?.trackRead(getDocumentSize(doc));
         if (filterFn(doc)) {
           returned++;
           yield doc;
@@ -2028,9 +2037,7 @@ function asyncSyscallImpl() {
       }
       case "1.0/queryStreamNext": {
         const { value, done } = db.queryNext(args.queryId);
-        if (!done && value !== null) {
-          tracker?.trackRead(getDocumentSize(value));
-        }
+
         return JSON.stringify(convexToJson({ value, done }));
       }
       case "1.0/queryPage": {
@@ -2179,6 +2186,11 @@ function asyncSyscallImpl() {
         );
       }
       case "1.0/runUdf": {
+        if (
+          (executionContextStorage.getStore()?.transactionCallDepth ?? 0) >= 8
+        ) {
+          throw new Error("Cross component call depth limit exceeded");
+        }
         const {
           udfType,
           name,
@@ -2435,20 +2447,7 @@ function asyncSyscallImpl() {
       }
       case "1.0/count": {
         const { table } = args;
-        const queryId = db.startQuery({
-          source: { type: "FullTableScan", tableName: table, order: "asc" },
-          operators: [],
-        });
-        let count = 0;
-
-        while (true) {
-          const result = db.queryNext(queryId);
-          if (result.done) {
-            break;
-          }
-          count += 1;
-        }
-        return JSON.stringify(count);
+        return JSON.stringify(db.count(table));
       }
       case "1.0/auditLog": {
         return JSON.stringify(null);
@@ -3128,6 +3127,7 @@ type FunctionPath = {
 type UdfType = "query" | "mutation" | "action" | "http";
 
 type ExecutionContext = {
+  transactionCallDepth?: number;
   componentPath: string;
   udfPath: string;
   udfType: UdfType;
@@ -3890,6 +3890,9 @@ function withAuth(
       componentPath: functionPath.componentPath,
       udfPath: functionPath.udfPath,
       udfType: "mutation",
+      transactionCallDepth: isNested
+        ? (parentCtx?.transactionCallDepth ?? 0) + 1
+        : 0,
       depth: (parentCtx?.depth ?? 0) + 1,
     };
     const requestMetadata = requestMetadataForExecution();
@@ -3959,6 +3962,9 @@ function withAuth(
       componentPath: functionPath.componentPath,
       udfPath: functionPath.udfPath,
       udfType: "query",
+      transactionCallDepth: isNested
+        ? (parentCtx?.transactionCallDepth ?? 0) + 1
+        : 0,
       depth: (parentCtx?.depth ?? 0) + 1,
       pagination: (isNested && parentCtx?.pagination) || { calls: 0 },
     };
