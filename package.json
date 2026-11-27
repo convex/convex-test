@@ -54,7 +54,7 @@
     "pkg-pr-new": "0.0.94",
     "prettier": "3.10.1",
     "replace-in-file": "9.0.0",
-    "typescript": "5.9.3",
+    "typescript": "7.0.2",
     "vitest": "1.6.1"
   }
 }
