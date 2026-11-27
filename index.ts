@@ -3516,12 +3516,7 @@ class TransactionManager {
       while (this._waitOnCurrentFunction !== null) {
         await this._waitOnCurrentFunction;
       }
-      // Round up in bigint arithmetic so a one-nanosecond commit clock tick
-      // cannot disappear when converted to milliseconds.
-      this._udfTime = Math.max(
-        frameworkNow(),
-        Number((this._lastCommitTs + 999_999n) / 1_000_000n),
-      );
+      this._udfTime = frameworkNow();
       this._waitOnCurrentFunction = new Promise((resolve) => {
         this._markTransactionDone = resolve;
       });
