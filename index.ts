@@ -3487,9 +3487,12 @@ class TransactionManager {
   // `startTransaction` / `commit` / `rollback` in lockstep with the databases'.
   private _metricsTracker: TransactionMetricsTracker | null = null;
   private _limitsConfig: Partial<TransactionMetrics> | boolean;
-  // The latest committed transaction's timestamp, in Unix nanoseconds.
-  // Zero represents the initial empty database, before any commits.
-  private _lastCommitTs: bigint = 0n;
+  // The greatest snapshot or commit timestamp assigned, in Unix nanoseconds.
+  // This survives queries and rollbacks so future commits stay strictly after
+  // every snapshot already issued, even if the clock moves backwards.
+  private _lastTimestamp: bigint = 0n;
+  // Fixed for the outermost transaction, including all nested/component calls.
+  private _snapshotTs: bigint | null = null;
   // Milliseconds pinned at top-level transaction start, shared by nested calls.
   private _udfTime: number | null = null;
   // Files already read by the current top-level transaction, including by
@@ -3516,15 +3519,19 @@ class TransactionManager {
       while (this._waitOnCurrentFunction !== null) {
         await this._waitOnCurrentFunction;
       }
-      // Round up in bigint arithmetic so a one-nanosecond commit clock tick
-      // cannot disappear when converted to milliseconds.
-      this._udfTime = Math.max(
-        frameworkNow(),
-        Number((this._lastCommitTs + 999_999n) / 1_000_000n),
-      );
       this._waitOnCurrentFunction = new Promise((resolve) => {
         this._markTransactionDone = resolve;
       });
+      // Sample time after taking the lock so all visible commits precede or
+      // equal this snapshot. Sampling at transaction entry models idle reader
+      // timestamp advancement without needing a background timer.
+      const nowNanos = BigInt(frameworkNow()) * 1_000_000n;
+      this._snapshotTs =
+        nowNanos > this._lastTimestamp ? nowNanos : this._lastTimestamp;
+      this._lastTimestamp = this._snapshotTs;
+      // Pin user time at or after the snapshot, rounding up so a nanosecond
+      // clock tick cannot disappear when converted to milliseconds.
+      this._udfTime = Number((this._snapshotTs + 999_999n) / 1_000_000n);
       this._metricsTracker = new TransactionMetricsTracker(this._limitsConfig);
       this._filesRead = new Set();
     }
@@ -3574,14 +3581,12 @@ class TransactionManager {
   }
 
   getSnapshotTs(): bigint {
-    if (!this.isInTransaction()) {
+    if (this._snapshotTs === null) {
       throw new Error(
         "getSnapshotTs() can only be called from a query or mutation.",
       );
     }
-    // Top-level transactions are serialized and nested commits don't advance
-    // _lastCommitTs, so it remains the latest commit known at transaction start.
-    return this._lastCommitTs;
+    return this._snapshotTs;
   }
 
   // Returns the transaction's commit timestamp, or null for a nested commit,
@@ -3591,10 +3596,11 @@ class TransactionManager {
     if (!isNested) {
       const nowNanos = BigInt(frameworkNow()) * 1_000_000n;
       // Assign a new timestamp only when committing the outermost transaction.
-      // Bump by one if the clock is frozen or has moved backwards.
+      // Stay strictly after every issued snapshot and commit, even if the
+      // clock is frozen or has moved backwards.
       commitTs =
-        nowNanos > this._lastCommitTs ? nowNanos : this._lastCommitTs + 1n;
-      this._lastCommitTs = commitTs;
+        nowNanos > this._lastTimestamp ? nowNanos : this._lastTimestamp + 1n;
+      this._lastTimestamp = commitTs;
     }
     const convex = getConvexGlobal();
     for (const component of Object.values(convex.components)) {
@@ -3622,6 +3628,7 @@ class TransactionManager {
       this._udfTime = null;
       this._metricsTracker = null;
       this._filesRead = null;
+      this._snapshotTs = null;
       this._waitOnCurrentFunction = null;
       this._markTransactionDone();
       this._markTransactionDone = null;
