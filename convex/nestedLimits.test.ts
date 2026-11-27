@@ -138,3 +138,13 @@ test("nested transactionLimits is optional", async () => {
   const count = await t.query(api.nestedLimits.parentReadNoLimits, {});
   expect(count).toBe(10);
 });
+
+test("a nested query reading the parent's range counts no new index range", async () => {
+  const t = convexTest(schema);
+  await t.run(async (ctx) => {
+    await ctx.db.insert("messages", { author: "sarah", body: "hello" });
+  });
+  expect(
+    await t.query(api.nestedLimits.readAllTwiceThenReportQueries, {}),
+  ).toBe(1);
+});
