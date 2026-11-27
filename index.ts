@@ -49,6 +49,7 @@ import {
   GenericId,
   JSONValue,
   Value,
+  ConvexError,
   compareValues,
   convexToJson,
   getConvexSize,
@@ -977,6 +978,24 @@ function tableNameFromId(id: string) {
     return null;
   }
   return id.slice(match[0].length);
+}
+
+function actionCall(fn: (...args: any[]) => Promise<any>) {
+  return async (...args: any[]) => {
+    try {
+      return await fn(...args);
+    } catch (error) {
+      if (error instanceof ConvexError) {
+        const propagated = new ConvexError(error.data);
+        propagated.message = `Uncaught ${error.toString()}`;
+        throw propagated;
+      }
+      // eslint-disable-next-line preserve-caught-error -- An isolate boundary discards the original error object.
+      throw new Error(
+        `Uncaught ${error instanceof Error ? error.toString() : String(error)}`,
+      );
+    }
+  };
 }
 
 // Reverses `serializeConvexErrorData` from `convex/server/impl/registration_impl`,
@@ -2193,38 +2212,44 @@ function asyncSyscallImpl() {
           reference,
           functionHandle,
         });
-        if (udfType === "query") {
-          return JSON.stringify(
-            convexToJson(
-              await withAuth().queryFromPath(
-                functionPath,
-                udfArgs,
-                transactionLimits,
+        try {
+          if (udfType === "query") {
+            return JSON.stringify(
+              convexToJson(
+                await withAuth().queryFromPath(
+                  functionPath,
+                  udfArgs,
+                  transactionLimits,
+                ),
               ),
-            ),
-          );
-        }
-        if (udfType === "snapshotQuery") {
-          return JSON.stringify(
-            convexToJson(
-              await withAuth().snapshotQueryFromPath(
-                functionPath,
-                udfArgs,
-                transactionLimits,
+            );
+          }
+          if (udfType === "snapshotQuery") {
+            return JSON.stringify(
+              convexToJson(
+                await withAuth().snapshotQueryFromPath(
+                  functionPath,
+                  udfArgs,
+                  transactionLimits,
+                ),
               ),
-            ),
-          );
-        }
-        if (udfType === "mutation") {
-          return JSON.stringify(
-            convexToJson(
-              await withAuth().mutationFromPath(
-                functionPath,
-                udfArgs,
-                transactionLimits,
+            );
+          }
+          if (udfType === "mutation") {
+            return JSON.stringify(
+              convexToJson(
+                await withAuth().mutationFromPath(
+                  functionPath,
+                  udfArgs,
+                  transactionLimits,
+                ),
               ),
-            ),
-          );
+            );
+          }
+        } catch (error) {
+          if (error instanceof ConvexError)
+            error.data = convexToJson(error.data);
+          throw error;
         }
         throw new Error(
           `\`convexTest\` does not support udf type: "${udfType}"`,
@@ -4014,9 +4039,9 @@ function withAuth(
       handler: (ctx: any, innerArgs: any) => {
         const testCtx = {
           ...ctx,
-          runQuery: ctxRunQuery,
-          runMutation: ctxRunMutation,
-          runAction: ctxRunAction,
+          runQuery: actionCall(ctxRunQuery),
+          runMutation: actionCall(ctxRunMutation),
+          runAction: actionCall(ctxRunAction),
           auth: authStorage.getStore() ?? auth,
         };
         return runWithGlobalOverrides({}, () => handler(testCtx, innerArgs));
@@ -4370,9 +4395,9 @@ function withAuth(
       const a = httpActionGeneric((ctx: any, a: any) => {
         const testCtx = {
           ...ctx,
-          runQuery: byType.query,
-          runMutation: byType.mutation,
-          runAction: byType.action,
+          runQuery: actionCall(byType.query),
+          runMutation: actionCall(byType.mutation),
+          runAction: actionCall(byType.action),
           auth,
         };
         return runWithGlobalOverrides({}, () => getHandler(func)(testCtx, a));
