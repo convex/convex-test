@@ -879,7 +879,7 @@ class DatabaseFake {
     });
 
     const filterFn = (doc: GenericDocument) =>
-      filters.every((f) => evaluateFilter(doc, f));
+      filters.every((f) => filterBoolean(evaluateFilter(doc, f)));
 
     return {
       sortedDocs: results,
@@ -1075,6 +1075,16 @@ function evaluateFieldPath(fieldPath: string, document: any) {
   return result === undefined ? undefined : resolvePendingValues(result);
 }
 
+function filterBoolean(value: Value | undefined) {
+  if (typeof value !== "boolean")
+    throw new Error("Cannot use non-boolean value as a Boolean");
+  return value;
+}
+function checkedInt64(value: bigint) {
+  if (BigInt.asIntN(64, value) !== value)
+    throw new Error("Filter arithmetic result is out of range for Int64");
+  return value;
+}
 function evaluateFilter(
   document: GenericDocument,
   filter: any,
@@ -1096,13 +1106,17 @@ function evaluateFilter(
     );
   }
   if (filter.$and !== undefined) {
-    return filter.$and.every((child: any) => evaluateFilter(document, child));
+    return filter.$and.every((child: any) =>
+      filterBoolean(evaluateFilter(document, child)),
+    );
   }
   if (filter.$or !== undefined) {
-    return filter.$or.some((child: any) => evaluateFilter(document, child));
+    return filter.$or.some((child: any) =>
+      filterBoolean(evaluateFilter(document, child)),
+    );
   }
   if (filter.$not !== undefined) {
-    return !evaluateFilter(document, filter.$not);
+    return !filterBoolean(evaluateFilter(document, filter.$not));
   }
   if (filter.$gt !== undefined) {
     return (
@@ -1129,34 +1143,55 @@ function evaluateFilter(
     );
   }
   if (filter.$add !== undefined) {
-    return (
-      (evaluateFilter(document, filter.$add[0]) as number) +
-      (evaluateFilter(document, filter.$add[1]) as number)
-    );
+    const left = evaluateFilter(document, filter.$add[0]);
+    const right = evaluateFilter(document, filter.$add[1]);
+    if (typeof left === "number" && typeof right === "number")
+      return left + right;
+    if (typeof left === "bigint" && typeof right === "bigint")
+      return checkedInt64(left + right);
+    throw new Error("Cannot add operands of incompatible types");
   }
   if (filter.$sub !== undefined) {
-    return (
-      (evaluateFilter(document, filter.$sub[0]) as number) -
-      (evaluateFilter(document, filter.$sub[1]) as number)
-    );
+    const left = evaluateFilter(document, filter.$sub[0]);
+    const right = evaluateFilter(document, filter.$sub[1]);
+    if (typeof left === "number" && typeof right === "number")
+      return left - right;
+    if (typeof left === "bigint" && typeof right === "bigint")
+      return checkedInt64(left - right);
+    throw new Error("Cannot sub operands of incompatible types");
   }
   if (filter.$mul !== undefined) {
-    return (
-      (evaluateFilter(document, filter.$mul[0]) as number) *
-      (evaluateFilter(document, filter.$mul[1]) as number)
-    );
+    const left = evaluateFilter(document, filter.$mul[0]);
+    const right = evaluateFilter(document, filter.$mul[1]);
+    if (typeof left === "number" && typeof right === "number")
+      return left * right;
+    if (typeof left === "bigint" && typeof right === "bigint")
+      return checkedInt64(left * right);
+    throw new Error("Cannot mul operands of incompatible types");
   }
   if (filter.$div !== undefined) {
-    return (
-      (evaluateFilter(document, filter.$div[0]) as number) /
-      (evaluateFilter(document, filter.$div[1]) as number)
-    );
+    const left = evaluateFilter(document, filter.$div[0]);
+    const right = evaluateFilter(document, filter.$div[1]);
+    if (typeof left === "number" && typeof right === "number")
+      return left / right;
+    if (typeof left === "bigint" && typeof right === "bigint")
+      return checkedInt64(left / right);
+    throw new Error("Cannot div operands of incompatible types");
   }
   if (filter.$mod !== undefined) {
-    return (
-      (evaluateFilter(document, filter.$mod[0]) as number) %
-      (evaluateFilter(document, filter.$mod[1]) as number)
-    );
+    const left = evaluateFilter(document, filter.$mod[0]);
+    const right = evaluateFilter(document, filter.$mod[1]);
+    if (typeof left === "number" && typeof right === "number")
+      return left % right;
+    if (typeof left === "bigint" && typeof right === "bigint")
+      return checkedInt64(left % right);
+    throw new Error("Cannot mod operands of incompatible types");
+  }
+  if (filter.$neg !== undefined) {
+    const value = evaluateFilter(document, filter.$neg);
+    if (typeof value === "number") return -value;
+    if (typeof value === "bigint") return checkedInt64(-value);
+    throw new Error("Cannot negate non-numeric value");
   }
   if (filter.$field !== undefined) {
     return evaluateFieldPath(filter.$field, document);
