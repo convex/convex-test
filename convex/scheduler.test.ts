@@ -301,6 +301,78 @@ describe("with fake timers", () => {
     ]);
   });
 
+  test("a function scheduled for now runs while the clock is frozen", async () => {
+    vi.setSystemTime(5_000);
+    const t = convexTest(schema);
+    // Two transactions in the same millisecond move the next one's time to
+    // 5_001, ahead of the clock.
+    await t.run(async () => {});
+    await t.run(async () => {});
+    await t.mutation(async (ctx) => {
+      await ctx.scheduler.runAfter(0, api.scheduler.add, {
+        body: "now",
+        author: "AI",
+      });
+    });
+
+    vi.advanceTimersByTime(0);
+    await t.finishInProgressScheduledFunctions();
+    expect(await t.query(internal.scheduler.jobs)).toMatchObject([
+      { state: { kind: "success" } },
+    ]);
+  });
+
+  test("an action's runAfter(1) waits 1 ms while the clock is frozen", async () => {
+    vi.setSystemTime(5_000);
+    const t = convexTest(schema);
+    await t.run(async () => {});
+    await t.run(async () => {});
+    await t.action(async (ctx) => {
+      await ctx.scheduler.runAfter(1, api.scheduler.add, {
+        body: "later",
+        author: "AI",
+      });
+    });
+
+    vi.advanceTimersByTime(0);
+    await t.finishInProgressScheduledFunctions();
+    expect(await t.query(internal.scheduler.jobs)).toMatchObject([
+      { state: { kind: "pending" } },
+    ]);
+    vi.advanceTimersByTime(1);
+    await t.finishInProgressScheduledFunctions();
+    expect(await t.query(internal.scheduler.jobs)).toMatchObject([
+      { state: { kind: "success" } },
+    ]);
+  });
+
+  // 1001 / 1000 * 1000 is 1000.9999999999999, and 2007 / 1000 * 1000 is
+  // 2007.0000000000002.
+  test.each([1_001, 2_007])(
+    "runAt(%i) runs at that millisecond, not before",
+    async (dueMs) => {
+      vi.setSystemTime(dueMs - 1);
+      const t = convexTest(schema);
+      await t.mutation(async (ctx) => {
+        await ctx.scheduler.runAt(dueMs, api.scheduler.add, {
+          body: "at",
+          author: "AI",
+        });
+      });
+
+      vi.advanceTimersByTime(0);
+      await t.finishInProgressScheduledFunctions();
+      expect(await t.query(internal.scheduler.jobs)).toMatchObject([
+        { state: { kind: "pending" } },
+      ]);
+      vi.advanceTimersByTime(1);
+      await t.finishInProgressScheduledFunctions();
+      expect(await t.query(internal.scheduler.jobs)).toMatchObject([
+        { state: { kind: "success" } },
+      ]);
+    },
+  );
+
   test("scheduled functions don't fire until time advances", async () => {
     const t = convexTest(schema);
 
