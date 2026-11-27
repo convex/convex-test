@@ -1106,26 +1106,34 @@ function evaluateFilter(
   }
   if (filter.$gt !== undefined) {
     return (
-      evaluateFilter(document, filter.$gt[0])! >
-      evaluateFilter(document, filter.$gt[1])!
+      compareValues(
+        evaluateFilter(document, filter.$gt[0]),
+        evaluateFilter(document, filter.$gt[1]),
+      ) > 0
     );
   }
   if (filter.$gte !== undefined) {
     return (
-      evaluateFilter(document, filter.$gte[0])! >=
-      evaluateFilter(document, filter.$gte[1])!
+      compareValues(
+        evaluateFilter(document, filter.$gte[0]),
+        evaluateFilter(document, filter.$gte[1]),
+      ) >= 0
     );
   }
   if (filter.$lt !== undefined) {
     return (
-      evaluateFilter(document, filter.$lt[0])! <
-      evaluateFilter(document, filter.$lt[1])!
+      compareValues(
+        evaluateFilter(document, filter.$lt[0]),
+        evaluateFilter(document, filter.$lt[1]),
+      ) < 0
     );
   }
   if (filter.$lte !== undefined) {
     return (
-      evaluateFilter(document, filter.$lte[0])! <=
-      evaluateFilter(document, filter.$lte[1])!
+      compareValues(
+        evaluateFilter(document, filter.$lte[0]),
+        evaluateFilter(document, filter.$lte[1]),
+      ) <= 0
     );
   }
   if (filter.$add !== undefined) {

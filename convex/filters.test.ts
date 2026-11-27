@@ -121,3 +121,33 @@ test("nested field", async () => {
     expect(thingsByIndex).toMatchObject([{ field: { nested: "some" } }]);
   });
 });
+
+test.each([
+  { left: undefined, right: null },
+  { left: null, right: -1n },
+  { left: 5n, right: 0 },
+  { left: -0, right: 0 },
+  { left: 5, right: "abc" },
+  { left: [9], right: [10] },
+])("ordered filters compare $left before $right", async ({ left, right }) => {
+  const t = convexTest();
+  await t.run(async (ctx) => {
+    const smaller = await ctx.db.insert(
+      "items",
+      left === undefined ? {} : { value: left },
+    );
+    const larger = await ctx.db.insert("items", { value: right });
+    for (const [operator, expected] of [
+      ["lt", [smaller]],
+      ["lte", [smaller, larger]],
+      ["gt", []],
+      ["gte", [larger]],
+    ] as const) {
+      const rows = await ctx.db
+        .query("items")
+        .filter((q) => q[operator](q.field("value"), right))
+        .collect();
+      expect(rows.map((row) => row._id)).toEqual(expected);
+    }
+  });
+});
