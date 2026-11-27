@@ -72,21 +72,24 @@ test.each([
   async ({ limits, error }) => {
     const { t } = await setup();
     const first = await t.query((ctx) =>
-      ctx.db.query("messages").paginate({ cursor: null, numItems: 2 }),
+      ctx.db
+        .query("messages")
+        .filter((q) => q.eq(q.field("author"), "nobody"))
+        .paginate({ cursor: null, numItems: 2, maximumRowsRead: 3 }),
     );
     for (const endCursor of [null, first.continueCursor, "_end_cursor"]) {
-      await expect(
-        t.query(async (ctx) =>
-          ctx.runQuery(
-            api.pagination.list,
-            {
-              author: "nobody",
-              paginationOptions: { cursor: null, numItems: 10, endCursor },
-            },
-            { transactionLimits: limits },
-          ),
+      const result = t.query(async (ctx) =>
+        ctx.runQuery(
+          api.pagination.list,
+          {
+            author: "nobody",
+            paginationOptions: { cursor: null, numItems: 10, endCursor },
+          },
+          { transactionLimits: limits },
         ),
-      ).rejects.toThrow(error);
+      );
+      if ("bytesRead" in limits) await expect(result).rejects.toThrow(error);
+      else expect((await result).pageStatus).toBe("SplitRequired");
     }
   },
 );
@@ -100,14 +103,20 @@ test.each(["asc", "desc"] as const)(
         .query("messages")
         .withIndex("author_body")
         .order(order)
-        .paginate({ cursor: null, numItems: 1 }),
+        .filter((q) => q.eq(q.field("author"), "nobody"))
+        .paginate({ cursor: null, numItems: 1, maximumRowsRead: 1 }),
     );
     const second = await t.query((ctx) =>
       ctx.db
         .query("messages")
         .withIndex("author_body")
         .order(order)
-        .paginate({ cursor: first.continueCursor, numItems: 2 }),
+        .filter((q) => q.eq(q.field("author"), "nobody"))
+        .paginate({
+          cursor: first.continueCursor,
+          numItems: 2,
+          maximumRowsRead: 2,
+        }),
     );
     const { result, metrics } = await t.query(async (ctx) => {
       const result = await ctx.db
@@ -125,7 +134,17 @@ test.each(["asc", "desc"] as const)(
     expect(result.page).toEqual([]);
     expect(result.continueCursor).toBe(second.continueCursor);
     expect(metrics.documentsRead.used).toBe(2);
-    expect(metrics.bytesRead.used).toBe(bytes(second.page));
+    expect(metrics.bytesRead.used).toBe(
+      bytes(
+        [...docs]
+          .sort(
+            (a, b) =>
+              (a.author.localeCompare(b.author) ||
+                a.body.localeCompare(b.body)) * (order === "asc" ? 1 : -1),
+          )
+          .slice(1, 3),
+      ),
+    );
     expect(metrics.bytesRead.used).toBeLessThan(bytes(docs));
   },
 );

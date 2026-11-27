@@ -56,6 +56,7 @@ import {
   jsonToConvex,
 } from "convex/values";
 import {
+  PaginationReadLimitError,
   TransactionMetricsTracker,
   TransactionMetrics,
 } from "./transactionMetrics.js";
@@ -616,6 +617,31 @@ class DatabaseFake {
       ? fieldPathsToSortBy
       : [...fieldPathsToSortBy, "_id"];
 
+    if (!Number.isInteger(pageSize) || pageSize < 1)
+      throw new Error("Must request at least 1 document while paginating");
+    if (pageSize > 32000)
+      throw new Error(`Requested too many items: ${pageSize}`);
+    for (const limit of [maximumBytesRead, maximumRowsRead]) {
+      if (limit != null && (!Number.isInteger(limit) || limit <= 0))
+        throw new Error("Pagination limits must be greater than 0");
+    }
+    const fingerprint = JSON.stringify([
+      this.componentPath,
+      query,
+      cursorFields,
+    ]);
+    const wrapCursor = (position: string) =>
+      JSON.stringify({ fingerprint, position });
+    const unwrapCursor = (cursor: string | null | undefined) => {
+      if (!cursor || cursor === "_end_cursor") return cursor;
+      const parsed = JSON.parse(cursor);
+      if (Array.isArray(parsed)) return cursor; // Cursors created by older versions.
+      if (parsed.fingerprint !== fingerprint)
+        throw new Error("InvalidCursor: cursor belongs to another query");
+      return parsed.position as string;
+    };
+    cursor = unwrapCursor(cursor) ?? null;
+    endCursor = unwrapCursor(endCursor);
     const parseCursor = (c: string | null | undefined) => {
       if (!c) return null;
       // null = undefined field; strings are JSON.stringify(convexToJson(v))
@@ -661,6 +687,22 @@ class DatabaseFake {
         }
       }
 
+      const readCandidate = () => {
+        try {
+          onRead(doc);
+          return true;
+        } catch (error) {
+          if (
+            !(error instanceof PaginationReadLimitError) ||
+            readDocCursors.length === 0
+          )
+            throw error;
+          pageStatus = "SplitRequired";
+          stoppedAtLimit = true;
+          continueCursor = readDocCursors[readDocCursors.length - 1];
+          return false;
+        }
+      };
       checkSearchCandidateLimit(query.source, rowsRead);
 
       // endCursor: stop when we reach or pass this position (inclusive boundary)
@@ -674,7 +716,7 @@ class DatabaseFake {
         if (cmp >= 0) {
           // At or past end cursor — include this doc if exactly at cursor, then stop
           if (cmp === 0) {
-            onRead(doc);
+            if (!readCandidate()) break;
             rowsRead += 1;
             readDocCursors.push(this._encodeCursor(doc, cursorFields));
             if (filterFn(doc)) {
@@ -686,7 +728,7 @@ class DatabaseFake {
         }
       }
 
-      onRead(doc);
+      if (!readCandidate()) break;
       rowsRead += 1;
       bytesRead += getDocumentSize(doc);
       readDocCursors.push(this._encodeCursor(doc, cursorFields));
@@ -729,6 +771,7 @@ class DatabaseFake {
       checkSearchCandidateLimit(query.source, rowsRead);
     }
 
+    if (endCursor) continueCursor = endCursor;
     if (continueCursor === "_end_cursor") {
       isDone = true;
     }
@@ -751,8 +794,8 @@ class DatabaseFake {
     return {
       page,
       isDone,
-      continueCursor,
-      splitCursor,
+      continueCursor: wrapCursor(continueCursor),
+      splitCursor: splitCursor === null ? null : wrapCursor(splitCursor),
       pageStatus,
     };
   }
